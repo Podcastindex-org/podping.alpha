@@ -7,8 +7,12 @@ use iroh_gossip::net::{Gossip, GOSSIP_ALPN};
 use iroh_gossip::proto::TopicId;
 use sha2::{Digest, Sha256};
 use std::env;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::mpsc;
+use futures_lite::StreamExt;
+use iroh_gossip::net::{Event, GossipEvent};
 
 // Cap'n Proto plexo message wrapper
 pub mod plexo_message_capnp {
@@ -93,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Subscribe to the topic (non-blocking, doesn't wait for peers)
     let topic = gossip.subscribe(topic_id, bootstrap_peers)?;
-    let (gossip_sender, _gossip_receiver) = topic.split();
+    let (gossip_sender, mut gossip_receiver) = topic.split();
     println!("  Joined gossip topic.");
 
     // --- mpsc channel: ZMQ thread -> async broadcast task ---
@@ -108,12 +112,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // --- Async receive task ---
+    tokio::spawn(async move {
+        while let Some(event) = gossip_receiver.next().await {
+            match event {
+                Ok(Event::Gossip(GossipEvent::Received(msg))) => {
+                    // Try to deserialize as GossipNotification
+                    match serde_json::from_slice::<notification::GossipNotification>(&msg.content) {
+                        Ok(notif) => {
+                            println!(
+                                "  GOSSIP RECV: [{} IRIs] sender={} medium={} reason={}",
+                                notif.iris.len(),
+                                &notif.sender[..8],
+                                notif.medium,
+                                notif.reason
+                            );
+                            for iri in notif.iris {
+                                println!("    > {}", iri);
+                            }
+                        }
+                        Err(_) => {
+                            // If it's not a GossipNotification, it might be raw data or another format
+                            println!("  GOSSIP RECV: unknown format ({} bytes)", msg.content.len());
+                        }
+                    }
+                }
+                Ok(Event::Gossip(_)) => {} // Other gossip events (Joined, NeighborUp, NeighborDown)
+                Ok(Event::Lagged) => {
+                    eprintln!("  Gossip receiver lagged, some messages were missed.");
+                }
+                Err(e) => {
+                    eprintln!("  Gossip receiver error: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+
+    // --- Shutdown flag for the blocking ZMQ thread ---
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_zmq = shutdown.clone();
+
     // --- ZMQ receive loop (blocking, runs in spawn_blocking) ---
     let zmq_bind_clone = zmq_bind.clone();
     let signing_key_clone = signing_key.clone();
     let pubkey_hex_clone = pubkey_hex.clone();
 
-    tokio::task::spawn_blocking(move || {
+    let zmq_handle = tokio::task::spawn_blocking(move || {
         let ctx = zmq::Context::new();
         let pull_socket = ctx.socket(zmq::PULL).unwrap();
         pull_socket.set_rcvtimeo(1000).unwrap(); // 1s recv timeout for shutdown checks
@@ -122,6 +167,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  ZMQ PULL socket bound on {}", zmq_bind_clone);
 
         loop {
+            if shutdown_zmq.load(Ordering::Relaxed) {
+                println!("  ZMQ thread: shutdown signal received.");
+                break;
+            }
+
             let mut msg = zmq::Message::new();
             match pull_socket.recv(&mut msg, 0) {
                 Ok(_) => {
@@ -139,7 +189,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(zmq::Error::EAGAIN) => {
-                    // recv timeout - just loop back (allows checking for shutdown)
+                    // recv timeout - loop back and check shutdown flag
                     continue;
                 }
                 Err(e) => {
@@ -154,6 +204,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\ngossip-writer running. Press Ctrl+C to stop.");
     signal::ctrl_c().await?;
     println!("\nShutting down...");
+
+    // Signal the ZMQ thread to exit, then wait for it
+    shutdown.store(true, Ordering::Relaxed);
+    let _ = zmq_handle.await;
+
     router.shutdown().await?;
 
     Ok(())
