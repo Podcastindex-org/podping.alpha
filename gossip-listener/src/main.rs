@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 
 const TOPIC_STRING: &str = "gossipping/v1/all";
 const DEFAULT_NODE_KEY_FILE: &str = "gossip_listener_node.key";
+const DEFAULT_KNOWN_PEERS_FILE: &str = "gossip_listener_known_peers.txt";
 
 // ---------------------------------------------------------------------------
 // Notification types (self-contained copy matching gossip-writer)
@@ -93,6 +94,8 @@ async fn main() -> anyhow::Result<()> {
     let bootstrap_peer_ids_str = env::var("BOOTSTRAP_PEER_IDS").unwrap_or_default();
     let node_key_file =
         env::var("IROH_NODE_KEY_FILE").unwrap_or_else(|_| DEFAULT_NODE_KEY_FILE.to_string());
+    let peers_file =
+        env::var("KNOWN_PEERS_FILE").unwrap_or_else(|_| DEFAULT_KNOWN_PEERS_FILE.to_string());
 
     // --- Derive topic ID (must match gossip-writer) ---
     let mut hasher = Sha256::new();
@@ -123,12 +126,19 @@ async fn main() -> anyhow::Result<()> {
         .spawn()
         .await?;
 
-    // --- Parse bootstrap peers ---
-    let bootstrap_peers: Vec<iroh::NodeId> = bootstrap_peer_ids_str
+    // --- Parse bootstrap peers and merge with known peers from file ---
+    let mut bootstrap_peers: Vec<iroh::NodeId> = bootstrap_peer_ids_str
         .split(',')
         .filter(|s| !s.trim().is_empty())
         .filter_map(|s| s.trim().parse().ok())
         .collect();
+
+    let file_peers = load_known_peers(&peers_file);
+    for p in file_peers {
+        if !bootstrap_peers.contains(&p) {
+            bootstrap_peers.push(p);
+        }
+    }
 
     if bootstrap_peers.is_empty() {
         println!("  No bootstrap peers configured; waiting for incoming connections.");
@@ -150,7 +160,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             item = stream.next() => {
                 match item {
-                    Some(Ok(event)) => handle_event(event),
+                    Some(Ok(event)) => handle_event(event, &peers_file, &my_node_id),
                     Some(Err(e)) => eprintln!("[error] gossip stream error: {e}"),
                     None => {
                         println!("[info] gossip stream ended");
@@ -170,7 +180,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn handle_event(event: Event) {
+fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::NodeId) {
     match event {
         Event::Gossip(GossipEvent::Received(msg)) => {
             let raw = &msg.content[..];
@@ -189,6 +199,7 @@ fn handle_event(event: Event) {
         }
         Event::Gossip(GossipEvent::NeighborUp(node_id)) => {
             println!("[event] NeighborUp: {node_id}");
+            save_peer_if_new(peers_file, &node_id, my_node_id);
         }
         Event::Gossip(GossipEvent::NeighborDown(node_id)) => {
             println!("[event] NeighborDown: {node_id}");
@@ -215,6 +226,43 @@ fn print_notification(notif: &GossipNotification) {
     println!("  iris:      {:?}", notif.iris);
     println!("  signature: {}", sig_status);
     println!();
+}
+
+/// Load known peers from a text file (one NodeId per line).
+/// Returns an empty vec if the file doesn't exist or can't be read.
+fn load_known_peers(path: &str) -> Vec<iroh::NodeId> {
+    let contents = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    contents
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| l.trim().parse().ok())
+        .collect()
+}
+
+/// Append a peer's NodeId to the known-peers file if it's not already present
+/// and not our own node ID.
+fn save_peer_if_new(path: &str, node_id: &iroh::NodeId, my_node_id: &iroh::NodeId) {
+    if node_id == my_node_id {
+        return;
+    }
+    let node_str = node_id.to_string();
+    let existing = fs::read_to_string(path).unwrap_or_default();
+    if existing.lines().any(|l| l.trim() == node_str) {
+        return;
+    }
+    use std::io::Write;
+    if let Some(parent) = Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = fs::create_dir_all(parent);
+        }
+    }
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{}", node_str);
+        println!("[info] Saved new peer to {}: {}", path, node_str);
+    }
 }
 
 /// Load a persistent iroh node key from `path`, or generate a new one and save it.

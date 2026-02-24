@@ -31,6 +31,7 @@ const DEFAULT_ZMQ_BIND: &str = "tcp://0.0.0.0:9998";
 const DEFAULT_KEY_FILE: &str = "/data/gossip/iroh.key";
 const DEFAULT_NODE_KEY_FILE: &str = "/data/gossip/iroh_node.key";
 const DEFAULT_ARCHIVE_PATH: &str = "/data/gossip/archive.db";
+const DEFAULT_KNOWN_PEERS_FILE: &str = "/data/gossip/known_peers.txt";
 const TOPIC_STRING: &str = "gossipping/v1/all";
 
 #[tokio::main]
@@ -42,6 +43,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::var("IROH_NODE_KEY_FILE").unwrap_or_else(|_| DEFAULT_NODE_KEY_FILE.to_string());
     let archive_path =
         env::var("ARCHIVE_PATH").unwrap_or_else(|_| DEFAULT_ARCHIVE_PATH.to_string());
+    let peers_file =
+        env::var("KNOWN_PEERS_FILE").unwrap_or_else(|_| DEFAULT_KNOWN_PEERS_FILE.to_string());
     let bootstrap_peer_ids_str = env::var("BOOTSTRAP_PEER_IDS").unwrap_or_default();
 
     println!("gossip-writer v{}", env!("CARGO_PKG_VERSION"));
@@ -49,6 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Key file:     {}", key_file);
     println!("  Node key:     {}", node_key_file);
     println!("  Archive:      {}", archive_path);
+    println!("  Peers file:   {}", peers_file);
     println!("  Topic:        {}", TOPIC_STRING);
 
     // --- Load or generate ed25519 signing key ---
@@ -90,12 +94,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .spawn()
         .await?;
 
-    // Parse bootstrap peer IDs (if any)
-    let bootstrap_peers: Vec<iroh::NodeId> = bootstrap_peer_ids_str
+    // Parse bootstrap peer IDs (if any) and merge with known peers from file
+    let mut bootstrap_peers: Vec<iroh::NodeId> = bootstrap_peer_ids_str
         .split(',')
         .filter(|s| !s.trim().is_empty())
         .filter_map(|s| s.trim().parse().ok())
         .collect();
+
+    let file_peers = load_known_peers(&peers_file);
+    for p in file_peers {
+        if !bootstrap_peers.contains(&p) {
+            bootstrap_peers.push(p);
+        }
+    }
 
     if bootstrap_peers.is_empty() {
         println!("  No bootstrap peers configured; joining topic with no initial peers.");
@@ -121,6 +132,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // --- Async receive task ---
+    let recv_peers_file = peers_file.clone();
+    let recv_my_node_id = my_node_id;
     tokio::spawn(async move {
         while let Some(event) = gossip_receiver.next().await {
             match event {
@@ -145,7 +158,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-                Ok(Event::Gossip(_)) => {} // Other gossip events (Joined, NeighborUp, NeighborDown)
+                Ok(Event::Gossip(GossipEvent::NeighborUp(node_id))) => {
+                    println!("  [event] NeighborUp: {node_id}");
+                    save_peer_if_new(&recv_peers_file, &node_id, &recv_my_node_id);
+                }
+                Ok(Event::Gossip(GossipEvent::NeighborDown(node_id))) => {
+                    println!("  [event] NeighborDown: {node_id}");
+                }
+                Ok(Event::Gossip(GossipEvent::Joined(peers))) => {
+                    println!("  [event] Joined topic with {} peer(s)", peers.len());
+                }
                 Ok(Event::Lagged) => {
                     eprintln!("  Gossip receiver lagged, some messages were missed.");
                 }
@@ -289,6 +311,43 @@ fn process_message(
     }
 
     Ok(())
+}
+
+/// Load known peers from a text file (one NodeId per line).
+/// Returns an empty vec if the file doesn't exist or can't be read.
+fn load_known_peers(path: &str) -> Vec<iroh::NodeId> {
+    let contents = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    contents
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| l.trim().parse().ok())
+        .collect()
+}
+
+/// Append a peer's NodeId to the known-peers file if it's not already present
+/// and not our own node ID.
+fn save_peer_if_new(path: &str, node_id: &iroh::NodeId, my_node_id: &iroh::NodeId) {
+    if node_id == my_node_id {
+        return;
+    }
+    let node_str = node_id.to_string();
+    let existing = fs::read_to_string(path).unwrap_or_default();
+    if existing.lines().any(|l| l.trim() == node_str) {
+        return;
+    }
+    use std::io::Write;
+    if let Some(parent) = Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = fs::create_dir_all(parent);
+        }
+    }
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{}", node_str);
+        println!("  Saved new peer to {}: {}", path, node_str);
+    }
 }
 
 /// Load a persistent iroh node key from `path`, or generate a new one and save it.
