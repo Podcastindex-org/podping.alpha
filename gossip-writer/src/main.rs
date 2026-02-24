@@ -3,10 +3,13 @@ mod notification;
 
 use bytes::Bytes;
 use iroh::protocol::Router;
+use iroh::SecretKey;
 use iroh_gossip::net::{Gossip, GOSSIP_ALPN};
 use iroh_gossip::proto::TopicId;
 use sha2::{Digest, Sha256};
 use std::env;
+use std::fs;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::signal;
@@ -26,6 +29,7 @@ use podping_schemas::org::podcastindex::podping::podping_write_capnp::podping_wr
 // Defaults
 const DEFAULT_ZMQ_BIND: &str = "tcp://0.0.0.0:9998";
 const DEFAULT_KEY_FILE: &str = "/data/gossip/iroh.key";
+const DEFAULT_NODE_KEY_FILE: &str = "/data/gossip/iroh_node.key";
 const DEFAULT_ARCHIVE_PATH: &str = "/data/gossip/archive.db";
 const TOPIC_STRING: &str = "gossipping/v1/all";
 
@@ -34,6 +38,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Configuration from environment ---
     let zmq_bind = env::var("ZMQ_BIND_ADDR").unwrap_or_else(|_| DEFAULT_ZMQ_BIND.to_string());
     let key_file = env::var("IROH_SECRET_FILE").unwrap_or_else(|_| DEFAULT_KEY_FILE.to_string());
+    let node_key_file =
+        env::var("IROH_NODE_KEY_FILE").unwrap_or_else(|_| DEFAULT_NODE_KEY_FILE.to_string());
     let archive_path =
         env::var("ARCHIVE_PATH").unwrap_or_else(|_| DEFAULT_ARCHIVE_PATH.to_string());
     let bootstrap_peer_ids_str = env::var("BOOTSTRAP_PEER_IDS").unwrap_or_default();
@@ -41,6 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("gossip-writer v{}", env!("CARGO_PKG_VERSION"));
     println!("  ZMQ bind:     {}", zmq_bind);
     println!("  Key file:     {}", key_file);
+    println!("  Node key:     {}", node_key_file);
     println!("  Archive:      {}", archive_path);
     println!("  Topic:        {}", TOPIC_STRING);
 
@@ -61,9 +68,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Topic ID: {}", hex::encode(topic_hash));
 
     // --- Set up Iroh endpoint and gossip ---
-    // Use iroh's own key for the endpoint (generated fresh - the ed25519-dalek key
-    // is for notification signing, the iroh endpoint has its own identity)
+    // Load or create a persistent iroh node key (separate from the ed25519-dalek signing key)
+    let node_key = load_or_create_node_key(&node_key_file)?;
     let endpoint = iroh::Endpoint::builder()
+        .secret_key(node_key)
         .discovery_n0()
         .bind()
         .await?;
@@ -281,4 +289,22 @@ fn process_message(
     }
 
     Ok(())
+}
+
+/// Load a persistent iroh node key from `path`, or generate a new one and save it.
+fn load_or_create_node_key(path: &str) -> Result<SecretKey, Box<dyn std::error::Error>> {
+    if Path::new(path).exists() {
+        let contents = fs::read_to_string(path)?;
+        let key: SecretKey = contents.trim().parse()?;
+        println!("  Loaded iroh node key from {}", path);
+        Ok(key)
+    } else {
+        let key = SecretKey::generate(rand::rngs::OsRng);
+        if let Some(parent) = Path::new(path).parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, key.to_string())?;
+        println!("  Generated new iroh node key -> {}", path);
+        Ok(key)
+    }
 }

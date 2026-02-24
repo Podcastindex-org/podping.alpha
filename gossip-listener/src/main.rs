@@ -1,14 +1,18 @@
 use std::env;
+use std::fs;
+use std::path::Path;
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use futures_lite::StreamExt;
 use iroh::protocol::Router;
+use iroh::SecretKey;
 use iroh_gossip::net::{Event, Gossip, GossipEvent, GOSSIP_ALPN};
 use iroh_gossip::proto::TopicId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const TOPIC_STRING: &str = "gossipping/v1/all";
+const DEFAULT_NODE_KEY_FILE: &str = "gossip_listener_node.key";
 
 // ---------------------------------------------------------------------------
 // Notification types (self-contained copy matching gossip-writer)
@@ -87,6 +91,8 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Config from env vars ---
     let bootstrap_peer_ids_str = env::var("BOOTSTRAP_PEER_IDS").unwrap_or_default();
+    let node_key_file =
+        env::var("IROH_NODE_KEY_FILE").unwrap_or_else(|_| DEFAULT_NODE_KEY_FILE.to_string());
 
     // --- Derive topic ID (must match gossip-writer) ---
     let mut hasher = Sha256::new();
@@ -97,7 +103,12 @@ async fn main() -> anyhow::Result<()> {
     println!("  Topic ID: {}", hex::encode(topic_hash));
 
     // --- Set up Iroh endpoint and gossip ---
-    let endpoint = iroh::Endpoint::builder().discovery_n0().bind().await?;
+    let node_key = load_or_create_node_key(&node_key_file)?;
+    let endpoint = iroh::Endpoint::builder()
+        .secret_key(node_key)
+        .discovery_n0()
+        .bind()
+        .await?;
 
     let my_node_id = endpoint.node_id();
     println!("  Iroh Node ID: {}", my_node_id);
@@ -204,4 +215,24 @@ fn print_notification(notif: &GossipNotification) {
     println!("  iris:      {:?}", notif.iris);
     println!("  signature: {}", sig_status);
     println!();
+}
+
+/// Load a persistent iroh node key from `path`, or generate a new one and save it.
+fn load_or_create_node_key(path: &str) -> anyhow::Result<SecretKey> {
+    if Path::new(path).exists() {
+        let contents = fs::read_to_string(path)?;
+        let key: SecretKey = contents.trim().parse()?;
+        println!("  Loaded iroh node key from {}", path);
+        Ok(key)
+    } else {
+        let key = SecretKey::generate(rand::rngs::OsRng);
+        if let Some(parent) = Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        fs::write(path, key.to_string())?;
+        println!("  Generated new iroh node key -> {}", path);
+        Ok(key)
+    }
 }
