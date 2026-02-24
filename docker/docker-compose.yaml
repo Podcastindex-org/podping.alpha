@@ -1,0 +1,69 @@
+version: "3.7"
+
+services:
+  podping-cloud:
+    image: podcastindexorg/podcasting20-podping.alpha/frontend:0.1.0
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 1m
+    user: "1000:1000"
+    ports:
+      - 80:80
+    volumes:
+      - /data:/data
+    environment:
+      ZMQ_SOCKET_ADDR: "192.168.69.69:9999"
+      GOSSIP_WRITER_ENABLED: "true"
+      GOSSIP_WRITER_ZMQ: "192.168.69.70:9998"
+    networks:
+      podping:
+        ipv4_address: 192.168.69.68
+    logging:
+      driver: "syslog"
+      options:
+        tag: "{{.ImageName}}/{{.Name}}/{{.ID}}"
+
+  hive-writer:
+    image: podcastindexorg/podping-hivewriter:2.1.0
+    command: ["server"]
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 1m
+    user: "1000:1000"
+    env_file:
+      - /opt/podping.cloud/hivewriter.env
+    networks:
+      podping:
+        ipv4_address: 192.168.69.69
+    logging:
+      driver: "syslog"
+      options:
+        tag: "{{.ImageName}}/{{.Name}}/{{.ID}}"
+
+  gossip-writer:
+    image: podcastindexorg/podcasting20-podping.alpha/gossip-writer:0.1.0
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    user: "1000:1000"
+    environment:
+      ZMQ_BIND_ADDR: "tcp://0.0.0.0:9998"
+      IROH_SECRET_FILE: "/data/gossip/iroh.key"
+      ARCHIVE_PATH: "/data/gossip/archive.db"
+      BOOTSTRAP_RELAYS: "https://gossipping.org/relays.json"
+    volumes:
+      - /data/gossip:/data/gossip
+    networks:
+      podping:
+        ipv4_address: 192.168.69.70
+    logging:
+      driver: "syslog"
+      options:
+        tag: "{{.ImageName}}/{{.Name}}/{{.ID}}"
+
+networks:
+  podping:
+    ipam:
+      driver: default
+      config:
+        - subnet: "192.168.69.0/24"

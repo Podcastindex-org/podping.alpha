@@ -1,0 +1,32 @@
+# Build artifacts #
+####################
+**/target/
+
+# editors #
+###########
+.vscode
+.idea/
+/venv
+.saved-info.txt
+
+__pycache__/
+hive-watcher/config/__pycache__/__init__.cpython-38.pyc
+
+# Example Specific Files #
+##########################
+/hive-watcher/examples/write-to-csv-analyze-with-R/data*
+### R ###
+# History files
+/hive-watcher/examples/write-to-csv-analyze-with-R/.Rhistory
+# Session Data files
+/hive-watcher/examples/write-to-csv-analyze-with-R/.RData
+# User-specific files
+/hive-watcher/examples/write-to-csv-analyze-with-R/.Ruserdata
+
+# Databases
+/podping/auth.db
+/podping/queue.db
+hive-watcher/err_prop.log
+hive-watcher/proposal-watcher.py
+**.DS_Store
+/podping/working_files/

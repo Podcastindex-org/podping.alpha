@@ -1,0 +1,42 @@
+[package]
+name = "gossip-writer"
+version = "0.1.0"
+authors = ["Dave Jones"]
+edition = "2021"
+build = "build.rs"
+
+[build-dependencies]
+capnpc = "0.19.0"
+
+[dependencies]
+# ZMQ for receiving from front-end
+zmq = "0.10"
+
+# Cap'n Proto for deserializing PlexoMessage/PodpingWrite
+capnp = "0.19.8"
+podping-schemas = { git = "https://github.com/Podcastindex-org/podping-schemas-rust.git", tag = "v1.1.0" }
+
+# Iroh gossip networking
+iroh = "0.32"
+iroh-gossip = "0.32"
+
+# Crypto: signing and hashing
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+blake3 = "1"
+sha2 = "0.10"
+rand = "0.8"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# SQLite archive
+rusqlite = { version = "0.28", features = ["bundled"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Utilities
+hex = "0.4"
+bytes = "1"
+futures-lite = "2"
