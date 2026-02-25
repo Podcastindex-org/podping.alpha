@@ -26,11 +26,12 @@ struct PeerAnnounce {
     #[serde(rename = "type")]
     msg_type: String,
     node_id: String,
+    version: String,
     timestamp: u64,
 }
 
 impl PeerAnnounce {
-    fn new(node_id: &str) -> Self {
+    fn new(node_id: &str, version: &str) -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -38,6 +39,7 @@ impl PeerAnnounce {
         Self {
             msg_type: "peer_announce".to_string(),
             node_id: node_id.to_string(),
+            version: version.to_string(),
             timestamp,
         }
     }
@@ -189,7 +191,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(peer_announce_interval)).await;
-                let announce = PeerAnnounce::new(&announce_node_id);
+                let announce = PeerAnnounce::new(&announce_node_id, env!("CARGO_PKG_VERSION"));
                 match serde_json::to_vec(&announce) {
                     Ok(payload) => {
                         if let Err(e) = sink.broadcast(Bytes::from(payload)).await {
@@ -243,7 +245,7 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::NodeId) {
             // Try PeerAnnounce first
             if let Ok(announce) = serde_json::from_slice::<PeerAnnounce>(raw) {
                 if announce.msg_type == "peer_announce" {
-                    println!("[info] PeerAnnounce from {}", announce.node_id);
+                    println!("[info] PeerAnnounce from {} v{}", announce.node_id, announce.version);
                     if let Ok(node_id) = announce.node_id.parse() {
                         save_peer_if_new(peers_file, &node_id, my_node_id);
                     }
