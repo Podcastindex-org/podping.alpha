@@ -153,10 +153,13 @@ async fn main() {
                 let gossip_addr = std::env::var("GOSSIP_WRITER_ZMQ")
                     .unwrap_or_else(|_| GOSSIP_ZMQ_ADDR.to_string());
                 let gossip_addr = format!("tcp://{}", gossip_addr);
-                println!("Gossip writer enabled, connecting PUSH socket to [{}]...", gossip_addr);
-                let gsock = context.socket(zmq::PUSH).unwrap();
+                println!("Gossip writer enabled, connecting PAIR socket to [{}]...", gossip_addr);
+                let gsock = context.socket(zmq::PAIR).unwrap();
                 if gsock.set_sndtimeo(GOSSIP_ZMQ_SEND_TIMEOUT).is_err() {
                     eprintln!("  Failed to set gossip zmq send timeout.");
+                }
+                if gsock.set_rcvtimeo(ZMQ_RECV_TIMEOUT).is_err() {
+                    eprintln!("  Failed to set gossip zmq receive timeout.");
                 }
                 if gsock.set_linger(0).is_err() {
                     eprintln!("  Failed to set gossip zmq to zero linger.");
@@ -165,9 +168,9 @@ async fn main() {
                     eprintln!("  Failed to set gossip zmq send HWM.");
                 }
                 if gsock.connect(&gossip_addr).is_err() {
-                    eprintln!("  Failed to connect gossip PUSH socket.");
+                    eprintln!("  Failed to connect gossip PAIR socket.");
                 }
-                println!("Gossip PUSH socket: [{}] connected.", gossip_addr);
+                println!("Gossip PAIR socket: [{}] connected.", gossip_addr);
                 Some(gsock)
             } else {
                 println!("Gossip writer disabled (set GOSSIP_WRITER_ENABLED=true to enable).");
@@ -189,6 +192,9 @@ async fn main() {
 
             //We always want to try and receive any waiting socket messages before moving on to sending
             receive_messages(&requester);
+            if let Some(ref gsock) = gossip_socket {
+                receive_messages(gsock);
+            }
 
             //Get the most recent X number of pings from the queue database
             let pinglist = dbif::get_pings_from_queue(false);
@@ -306,11 +312,14 @@ async fn main() {
                         //Again, try to receive any messages waiting on the socket so that we effectively
                         //interleave the receives and sends to speed things up and not have one "block" the other
                         receive_messages(&requester);
+                        if let Some(ref gsock) = gossip_socket {
+                            receive_messages(gsock);
+                        }
                         sent += 1;
                     }
                 },
                 Err(e) => {
-                    println!("  Error: [{}] checking queue.", e);
+                    eprintln!("  Error: [{}] checking queue.", e);
                 }
             }
 

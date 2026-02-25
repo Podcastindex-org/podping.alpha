@@ -24,6 +24,7 @@ use crate::plexo_message_capnp::plexo_message;
 
 // Podping schema types for deserialization
 use podping_schemas::org::podcastindex::podping::podping_write_capnp::podping_write;
+use podping_schemas::org::podcastindex::podping::hivewriter::podping_hive_transaction_capnp::podping_hive_transaction;
 
 // ---------------------------------------------------------------------------
 // PeerAnnounce: periodic node ID announcement over gossip
@@ -263,11 +264,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let zmq_handle = tokio::task::spawn_blocking(move || {
         let ctx = zmq::Context::new();
-        let pull_socket = ctx.socket(zmq::PULL).unwrap();
+        let pull_socket = ctx.socket(zmq::PAIR).unwrap();
         pull_socket.set_rcvtimeo(1000).unwrap(); // 1s recv timeout for shutdown checks
+        pull_socket.set_sndtimeo(100).unwrap(); // 100ms send timeout for replies
         pull_socket.set_linger(0).unwrap();
         pull_socket.bind(&zmq_bind_clone).unwrap();
-        println!("  ZMQ PULL socket bound on {}", zmq_bind_clone);
+        println!("  ZMQ PAIR socket bound on {}", zmq_bind_clone);
 
         loop {
             if shutdown_zmq.load(Ordering::Relaxed) {
@@ -284,6 +286,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &pubkey_hex_clone,
                         &db,
                         &tx,
+                        &pull_socket,
                     ) {
                         Ok(_) => {}
                         Err(e) => {
@@ -325,6 +328,7 @@ fn process_message(
     pubkey_hex: &str,
     db: &archive::Archive,
     tx: &mpsc::Sender<Vec<u8>>,
+    socket: &zmq::Socket,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Read the PlexoMessage wrapper
     let message_reader =
@@ -359,6 +363,7 @@ fn process_message(
     );
 
     // Build and sign the Gossipping notification
+    let iri_clone = iri.clone();
     let mut notif =
         notification::GossipNotification::new(pubkey_hex, medium_str, reason_str, vec![iri]);
     let signed_payload = notif.sign(signing_key);
@@ -379,7 +384,57 @@ fn process_message(
 
     // Send to the async broadcast task via mpsc channel
     match tx.blocking_send(signed_payload) {
-        Ok(_) => println!("    Queued for gossip broadcast."),
+        Ok(_) => {
+            println!("    Queued for gossip broadcast.");
+
+            // Build a PodpingHiveTransaction reply so podping can remove the IRI from the queue
+            let timestamp_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let timestamp_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64;
+
+            // Build inner PodpingHiveTransaction
+            let mut tx_message = capnp::message::Builder::new_default();
+            {
+                let mut hive_tx = tx_message.init_root::<podping_hive_transaction::Builder>();
+                hive_tx.set_hive_tx_id("gossip");
+                hive_tx.set_hive_block_num(timestamp_secs);
+                let mut podpings = hive_tx.init_podpings(1);
+                {
+                    let mut pp = podpings.reborrow().get(0);
+                    pp.set_medium(medium_enum);
+                    pp.set_reason(reason_enum);
+                    pp.set_timestamp_ns(timestamp_ns);
+                    pp.set_session_id(0);
+                    let mut iris = pp.init_iris(1);
+                    iris.set(0, &iri_clone);
+                }
+            }
+
+            // Serialize the inner message
+            let mut tx_payload = Vec::new();
+            capnp::serialize::write_message(&mut tx_payload, &tx_message)?;
+
+            // Wrap in PlexoMessage
+            let mut plexo_builder = capnp::message::Builder::new_default();
+            {
+                let mut plexo = plexo_builder.init_root::<plexo_message::Builder>();
+                plexo.set_type_name("org.podcastindex.podping.hivewriter.PodpingHiveTransaction.capnp");
+                plexo.set_payload(capnp::data::Reader::from(tx_payload.as_slice()));
+            }
+
+            // Serialize and send the reply
+            let mut reply_buf = Vec::new();
+            capnp::serialize::write_message(&mut reply_buf, &plexo_builder)?;
+            match socket.send(&reply_buf, 0) {
+                Ok(_) => println!("    Sent PodpingHiveTransaction reply (gossip)."),
+                Err(e) => eprintln!("    Failed to send reply: {}", e),
+            }
+        }
         Err(e) => eprintln!("    Failed to queue for broadcast: {}", e),
     }
 
