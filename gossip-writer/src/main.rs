@@ -16,6 +16,8 @@ use tokio::signal;
 use tokio::sync::mpsc;
 use futures_lite::StreamExt;
 use iroh_gossip::net::{Event, GossipEvent};
+use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // Cap'n Proto plexo message wrapper
 pub mod plexo_message_capnp {
@@ -25,6 +27,32 @@ use crate::plexo_message_capnp::plexo_message;
 
 // Podping schema types for deserialization
 use podping_schemas::org::podcastindex::podping::podping_write_capnp::podping_write;
+
+// ---------------------------------------------------------------------------
+// PeerAnnounce: periodic node ID announcement over gossip
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PeerAnnounce {
+    #[serde(rename = "type")]
+    msg_type: String,
+    node_id: String,
+    timestamp: u64,
+}
+
+impl PeerAnnounce {
+    fn new(node_id: &str) -> Self {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        Self {
+            msg_type: "peer_announce".to_string(),
+            node_id: node_id.to_string(),
+            timestamp,
+        }
+    }
+}
 
 // Defaults
 const DEFAULT_ZMQ_BIND: &str = "tcp://0.0.0.0:9998";
@@ -46,6 +74,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let peers_file =
         env::var("KNOWN_PEERS_FILE").unwrap_or_else(|_| DEFAULT_KNOWN_PEERS_FILE.to_string());
     let bootstrap_peer_ids_str = env::var("BOOTSTRAP_PEER_IDS").unwrap_or_default();
+    let peer_announce_interval: u64 = env::var("PEER_ANNOUNCE_INTERVAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
 
     println!("gossip-writer v{}", env!("CARGO_PKG_VERSION"));
     println!("  ZMQ bind:     {}", zmq_bind);
@@ -54,6 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Archive:      {}", archive_path);
     println!("  Peers file:   {}", peers_file);
     println!("  Topic:        {}", TOPIC_STRING);
+    println!("  Announce interval: {}s", peer_announce_interval);
 
     // --- Load or generate ed25519 signing key ---
     let signing_key = notification::load_or_generate_key(&key_file)?;
@@ -121,6 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- mpsc channel: ZMQ thread -> async broadcast task ---
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1000);
+    let announce_tx = tx.clone();
 
     // --- Async broadcast task ---
     tokio::spawn(async move {
@@ -131,6 +165,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // --- Periodic PeerAnnounce task ---
+    if peer_announce_interval > 0 {
+        let announce_node_id = my_node_id.to_string();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(peer_announce_interval)).await;
+                let announce = PeerAnnounce::new(&announce_node_id);
+                match serde_json::to_vec(&announce) {
+                    Ok(payload) => {
+                        if let Err(e) = announce_tx.send(payload).await {
+                            eprintln!("  Failed to queue PeerAnnounce: {}", e);
+                        } else {
+                            println!("  Broadcast PeerAnnounce for {}", announce_node_id);
+                        }
+                    }
+                    Err(e) => eprintln!("  Failed to serialize PeerAnnounce: {}", e),
+                }
+            }
+        });
+    }
+
     // --- Async receive task ---
     let recv_peers_file = peers_file.clone();
     let recv_my_node_id = my_node_id;
@@ -138,23 +193,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         while let Some(event) = gossip_receiver.next().await {
             match event {
                 Ok(Event::Gossip(GossipEvent::Received(msg))) => {
-                    // Try to deserialize as GossipNotification
-                    match serde_json::from_slice::<notification::GossipNotification>(&msg.content) {
-                        Ok(notif) => {
-                            println!(
-                                "  GOSSIP RECV: [{} IRIs] sender={} medium={} reason={}",
-                                notif.iris.len(),
-                                &notif.sender[..8],
-                                notif.medium,
-                                notif.reason
-                            );
-                            for iri in notif.iris {
-                                println!("    > {}", iri);
+                    // Try PeerAnnounce first
+                    if let Ok(announce) = serde_json::from_slice::<PeerAnnounce>(&msg.content) {
+                        if announce.msg_type == "peer_announce" {
+                            println!("  GOSSIP RECV: PeerAnnounce from {}", announce.node_id);
+                            if let Ok(node_id) = announce.node_id.parse() {
+                                save_peer_if_new(&recv_peers_file, &node_id, &recv_my_node_id);
                             }
                         }
-                        Err(_) => {
-                            // If it's not a GossipNotification, it might be raw data or another format
-                            println!("  GOSSIP RECV: unknown format ({} bytes)", msg.content.len());
+                    } else {
+                        // Fall back to GossipNotification
+                        match serde_json::from_slice::<notification::GossipNotification>(&msg.content) {
+                            Ok(notif) => {
+                                println!(
+                                    "  GOSSIP RECV: [{} IRIs] sender={} medium={} reason={}",
+                                    notif.iris.len(),
+                                    &notif.sender[..8],
+                                    notif.medium,
+                                    notif.reason
+                                );
+                                for iri in notif.iris {
+                                    println!("    > {}", iri);
+                                }
+                            }
+                            Err(_) => {
+                                println!("  GOSSIP RECV: unknown format ({} bytes)", msg.content.len());
+                            }
                         }
                     }
                 }
@@ -327,25 +391,45 @@ fn load_known_peers(path: &str) -> Vec<iroh::NodeId> {
         .collect()
 }
 
-/// Append a peer's NodeId to the known-peers file if it's not already present
-/// and not our own node ID.
+/// Save a peer's NodeId to the known-peers file if it's not already present
+/// and not our own node ID. Caps the file at MAX_KNOWN_PEERS entries,
+/// evicting the oldest (first) entries when full.
+const MAX_KNOWN_PEERS: usize = 15;
+
 fn save_peer_if_new(path: &str, node_id: &iroh::NodeId, my_node_id: &iroh::NodeId) {
     if node_id == my_node_id {
         return;
     }
     let node_str = node_id.to_string();
-    let existing = fs::read_to_string(path).unwrap_or_default();
-    if existing.lines().any(|l| l.trim() == node_str) {
+    let mut peers: Vec<String> = fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    if peers.iter().any(|l| l == &node_str) {
         return;
     }
+
+    peers.push(node_str.clone());
+
+    // Evict oldest entries if over the cap
+    if peers.len() > MAX_KNOWN_PEERS {
+        let drain_count = peers.len() - MAX_KNOWN_PEERS;
+        peers.drain(..drain_count);
+    }
+
     use std::io::Write;
     if let Some(parent) = Path::new(path).parent() {
         if !parent.as_os_str().is_empty() {
             let _ = fs::create_dir_all(parent);
         }
     }
-    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "{}", node_str);
+    if let Ok(mut f) = fs::File::create(path) {
+        for p in &peers {
+            let _ = writeln!(f, "{}", p);
+        }
         println!("  Saved new peer to {}: {}", path, node_str);
     }
 }
