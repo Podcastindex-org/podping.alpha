@@ -17,14 +17,15 @@ capnp = "0.19.8"
 podping-schemas = { git = "https://github.com/Podcastindex-org/podping-schemas-rust.git", tag = "v1.1.0" }
 
 # Iroh gossip networking
-iroh = "0.32"
-iroh-gossip = "0.32"
+iroh = "0.96"
+iroh-gossip = { version = "0.96", features = ["net"] }
+distributed-topic-tracker = { git = "https://github.com/rustonbsd/distributed-topic-tracker.git" }
 
 # Crypto: signing and hashing
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { version = "3.0.0-pre.1", features = ["rand_core"] }
 blake3 = "1"
 sha2 = "0.10"
-rand = "0.8"
+rand = "0.9"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -39,4 +40,3 @@ tokio = { version = "1", features = ["full"] }
 # Utilities
 hex = "0.4"
 bytes = "1"
-futures-lite = "2"

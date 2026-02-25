@@ -3,19 +3,18 @@ use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bytes::Bytes;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use futures_lite::StreamExt;
 use iroh::protocol::Router;
 use iroh::SecretKey;
-use iroh_gossip::net::{Event, Gossip, GossipEvent, GOSSIP_ALPN};
-use iroh_gossip::proto::TopicId;
+use iroh_gossip::api::Event;
+use iroh_gossip::net::Gossip;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use distributed_topic_tracker::{AutoDiscoveryGossip, RecordPublisher, TopicId as DttTopicId};
 
 const TOPIC_STRING: &str = "gossipping/v1/all";
 const DEFAULT_NODE_KEY_FILE: &str = "gossip_listener_node.key";
 const DEFAULT_KNOWN_PEERS_FILE: &str = "gossip_listener_known_peers.txt";
+const DEFAULT_DHT_SECRET: &str = "podping_gossip_default_secret";
 
 // ---------------------------------------------------------------------------
 // PeerAnnounce: periodic node ID announcement over gossip
@@ -126,38 +125,52 @@ async fn main() -> anyhow::Result<()> {
         env::var("IROH_NODE_KEY_FILE").unwrap_or_else(|_| DEFAULT_NODE_KEY_FILE.to_string());
     let peers_file =
         env::var("KNOWN_PEERS_FILE").unwrap_or_else(|_| DEFAULT_KNOWN_PEERS_FILE.to_string());
+    let dht_initial_secret = env::var("DHT_INITIAL_SECRET")
+        .unwrap_or_else(|_| DEFAULT_DHT_SECRET.to_string());
 
-    // --- Derive topic ID (must match gossip-writer) ---
-    let mut hasher = Sha256::new();
-    hasher.update(TOPIC_STRING.as_bytes());
-    let topic_hash: [u8; 32] = hasher.finalize().into();
-    let topic_id = TopicId::from_bytes(topic_hash);
     println!("  Topic: \"{}\"", TOPIC_STRING);
-    println!("  Topic ID: {}", hex::encode(topic_hash));
+    println!("  DHT discovery: enabled");
 
     // --- Set up Iroh endpoint and gossip ---
     let node_key = load_or_create_node_key(&node_key_file)?;
+    let node_key_bytes = node_key.to_bytes();
     let endpoint = iroh::Endpoint::builder()
         .secret_key(node_key)
-        .discovery_n0()
         .bind()
         .await?;
 
-    let my_node_id = endpoint.node_id();
+    let my_node_id = endpoint.id();
     println!("  Iroh Node ID: {}", my_node_id);
 
     let gossip = Gossip::builder()
         .max_message_size(65536)
-        .spawn(endpoint.clone())
-        .await?;
+        .spawn(endpoint.clone());
 
-    let router = Router::builder(endpoint.clone())
-        .accept(GOSSIP_ALPN, gossip.clone())
-        .spawn()
-        .await?;
+    let _router = Router::builder(endpoint.clone())
+        .accept(iroh_gossip::ALPN, gossip.clone())
+        .spawn();
 
-    // --- Parse bootstrap peers and merge with known peers from file ---
-    let mut bootstrap_peers: Vec<iroh::NodeId> = bootstrap_peer_ids_str
+    // --- DHT auto-discovery: subscribe to topic ---
+    let dht_signing_key = ed25519_dalek::SigningKey::from_bytes(&node_key_bytes);
+    let dtt_topic_id = DttTopicId::new(TOPIC_STRING.to_string());
+    println!("  Topic ID: {}", hex::encode(dtt_topic_id.hash()));
+
+    let record_publisher = RecordPublisher::new(
+        dtt_topic_id,
+        dht_signing_key.verifying_key(),
+        dht_signing_key,
+        None,
+        dht_initial_secret.into_bytes(),
+    );
+
+    let topic = gossip
+        .subscribe_and_join_with_auto_discovery_no_wait(record_publisher)
+        .await?;
+    let (gossip_sender, gossip_receiver) = topic.split().await?;
+    println!("  Joined gossip topic with DHT auto-discovery.");
+
+    // --- Optionally join bootstrap peers ---
+    let mut bootstrap_peers: Vec<iroh::EndpointId> = bootstrap_peer_ids_str
         .split(',')
         .filter(|s| !s.trim().is_empty())
         .filter_map(|s| s.trim().parse().ok())
@@ -171,13 +184,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if bootstrap_peers.is_empty() {
-        println!("  No bootstrap peers configured; waiting for incoming connections.");
+        println!("  No additional bootstrap peers configured.");
     } else {
-        println!("  Bootstrap peers: {:?}", bootstrap_peers);
+        println!("  Joining {} bootstrap peers...", bootstrap_peers.len());
+        if let Err(e) = gossip_sender.join_peers(bootstrap_peers, None).await {
+            eprintln!("  Warning: failed to join bootstrap peers: {}", e);
+        }
     }
-
-    // --- Subscribe to the topic ---
-    let (sink, mut stream) = gossip.subscribe(topic_id, bootstrap_peers)?.split();
 
     // --- Periodic PeerAnnounce task ---
     let peer_announce_interval: u64 = env::var("PEER_ANNOUNCE_INTERVAL")
@@ -187,6 +200,7 @@ async fn main() -> anyhow::Result<()> {
     println!("  Announce interval: {}s", peer_announce_interval);
 
     if peer_announce_interval > 0 {
+        let announce_sender = gossip_sender.clone();
         let announce_node_id = my_node_id.to_string();
         tokio::spawn(async move {
             loop {
@@ -194,7 +208,7 @@ async fn main() -> anyhow::Result<()> {
                 let announce = PeerAnnounce::new(&announce_node_id, env!("CARGO_PKG_VERSION"));
                 match serde_json::to_vec(&announce) {
                     Ok(payload) => {
-                        if let Err(e) = sink.broadcast(Bytes::from(payload)).await {
+                        if let Err(e) = announce_sender.broadcast(payload).await {
                             eprintln!("[error] Failed to broadcast PeerAnnounce: {}", e);
                         } else {
                             println!("[info] Broadcast PeerAnnounce for {}", announce_node_id);
@@ -204,8 +218,6 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         });
-    } else {
-        drop(sink);
     }
 
     println!("\n  Listening for gossip notifications...\n");
@@ -216,7 +228,7 @@ async fn main() -> anyhow::Result<()> {
 
     loop {
         tokio::select! {
-            item = stream.next() => {
+            item = gossip_receiver.next() => {
                 match item {
                     Some(Ok(event)) => handle_event(event, &peers_file, &my_node_id),
                     Some(Err(e)) => eprintln!("[error] gossip stream error: {e}"),
@@ -233,14 +245,14 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    router.shutdown().await?;
+    endpoint.close().await;
     println!("[info] goodbye");
     Ok(())
 }
 
-fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::NodeId) {
+fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId) {
     match event {
-        Event::Gossip(GossipEvent::Received(msg)) => {
+        Event::Received(msg) => {
             let raw = &msg.content[..];
             // Try PeerAnnounce first
             if let Ok(announce) = serde_json::from_slice::<PeerAnnounce>(raw) {
@@ -263,14 +275,11 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::NodeId) {
                 }
             }
         }
-        Event::Gossip(GossipEvent::Joined(peers)) => {
-            println!("[event] Joined topic with {} peer(s)", peers.len());
-        }
-        Event::Gossip(GossipEvent::NeighborUp(node_id)) => {
+        Event::NeighborUp(node_id) => {
             println!("[event] NeighborUp: {node_id}");
             save_peer_if_new(peers_file, &node_id, my_node_id);
         }
-        Event::Gossip(GossipEvent::NeighborDown(node_id)) => {
+        Event::NeighborDown(node_id) => {
             println!("[event] NeighborDown: {node_id}");
         }
         Event::Lagged => {
@@ -299,7 +308,7 @@ fn print_notification(notif: &GossipNotification) {
 
 /// Load known peers from a text file (one NodeId per line).
 /// Returns an empty vec if the file doesn't exist or can't be read.
-fn load_known_peers(path: &str) -> Vec<iroh::NodeId> {
+fn load_known_peers(path: &str) -> Vec<iroh::EndpointId> {
     let contents = match fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
@@ -316,7 +325,7 @@ fn load_known_peers(path: &str) -> Vec<iroh::NodeId> {
 /// evicting the oldest (first) entries when full.
 const MAX_KNOWN_PEERS: usize = 15;
 
-fn save_peer_if_new(path: &str, node_id: &iroh::NodeId, my_node_id: &iroh::NodeId) {
+fn save_peer_if_new(path: &str, node_id: &iroh::EndpointId, my_node_id: &iroh::EndpointId) {
     if node_id == my_node_id {
         return;
     }
@@ -357,18 +366,27 @@ fn save_peer_if_new(path: &str, node_id: &iroh::NodeId, my_node_id: &iroh::NodeI
 /// Load a persistent iroh node key from `path`, or generate a new one and save it.
 fn load_or_create_node_key(path: &str) -> anyhow::Result<SecretKey> {
     if Path::new(path).exists() {
-        let contents = fs::read_to_string(path)?;
-        let key: SecretKey = contents.trim().parse()?;
+        let raw = fs::read(path)?;
+        // Try string-based parse first (backward compat with iroh 0.32 format)
+        if let Ok(s) = std::str::from_utf8(&raw) {
+            if let Ok(key) = s.trim().parse::<SecretKey>() {
+                println!("  Loaded iroh node key from {}", path);
+                return Ok(key);
+            }
+        }
+        // Fall back to raw 32-byte format
+        let key_bytes: [u8; 32] = raw.try_into()
+            .map_err(|_| anyhow::anyhow!("key file {} has invalid length", path))?;
         println!("  Loaded iroh node key from {}", path);
-        Ok(key)
+        Ok(SecretKey::from_bytes(&key_bytes))
     } else {
-        let key = SecretKey::generate(rand::rngs::OsRng);
+        let key = SecretKey::generate(&mut rand::rng());
         if let Some(parent) = Path::new(path).parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)?;
             }
         }
-        fs::write(path, key.to_string())?;
+        fs::write(path, key.to_bytes())?;
         println!("  Generated new iroh node key -> {}", path);
         Ok(key)
     }

@@ -100,8 +100,7 @@ pub fn load_or_generate_key(path: &str) -> Result<SigningKey, Box<dyn Error>> {
         if let Some(parent) = p.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut csprng = rand::rngs::OsRng;
-        let signing_key = SigningKey::generate(&mut csprng);
+        let signing_key = SigningKey::generate(&mut rand::rng());
         fs::write(p, signing_key.to_bytes())?;
         eprintln!("Generated new ed25519 key at {}", path);
         Ok(signing_key)
