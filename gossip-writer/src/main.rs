@@ -430,7 +430,7 @@ fn process_message(
             // Serialize and send the reply
             let mut reply_buf = Vec::new();
             capnp::serialize::write_message(&mut reply_buf, &plexo_builder)?;
-            match socket.send(&reply_buf, 0) {
+            match socket.send(&reply_buf, zmq::DONTWAIT) {
                 Ok(_) => println!("    Sent PodpingHiveTransaction reply (gossip)."),
                 Err(e) => eprintln!("    Failed to send reply: {}", e),
             }
