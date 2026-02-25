@@ -93,9 +93,15 @@ async fn main() {
     //and just use that one each time.  This would be for single use inside a publisher where there would be no
     //other publishers using the system.  This param could be passed to docker with an env
 
+    //Check for --ephemeral flag
+    let ephemeral = env::args().any(|a| a == "--ephemeral");
+
     //Get what version we are
     let version = env!("CARGO_PKG_VERSION");
     println!("Version: {}", version);
+    if ephemeral {
+        println!("Mode: EPHEMERAL (IRIs removed from queue on send)");
+    }
     println!("--------------------");
 
     //Make sure we have databases
@@ -258,24 +264,23 @@ async fn main() {
 
                         match requester.send(send_buffer, 0) {
                             Ok(_) => {
-                                // println!("      IRI sent.");
-                                //If the write was successful, mark this ping as "in flight"
-                                match dbif::set_ping_as_inflight(&ping) {
-                                    Ok(_) => {
-                                        // println!("      Marked: [{}|{}|{}|{}] as in flight.",
-                                        //      ping.url.clone(),
-                                        //      ping.time,
-                                        //      ping.reason,
-                                        //      ping.medium
-                                        // );
-                                    },
-                                    Err(_) => {
-                                        eprintln!("      Failed to mark: [{}|{}|{}|{}] as in flight.",
-                                                 ping.url.clone(),
-                                                 ping.time,
-                                                 ping.reason,
-                                                 ping.medium
-                                        );
+                                if ephemeral {
+                                    //In ephemeral mode, remove the IRI from the queue immediately
+                                    if dbif::delete_ping_from_queue(ping.url.clone()).is_err() {
+                                        eprintln!("      Failed to delete: [{}] from queue.", ping.url);
+                                    }
+                                } else {
+                                    //If the write was successful, mark this ping as "in flight"
+                                    match dbif::set_ping_as_inflight(&ping) {
+                                        Ok(_) => { },
+                                        Err(_) => {
+                                            eprintln!("      Failed to mark: [{}|{}|{}|{}] as in flight.",
+                                                     ping.url.clone(),
+                                                     ping.time,
+                                                     ping.reason,
+                                                     ping.medium
+                                            );
+                                        }
                                     }
                                 }
                             },
@@ -331,7 +336,7 @@ async fn main() {
             //Reset old inflight pings that may have never been sent, but only do this
             //when things are not super busy since that is a sign that the writer may
             //be full up and we need to allow more time
-            if sent < 25 {
+            if !ephemeral && sent < 25 {
                 if dbif::reset_pings_in_flight().is_err() {
                     eprintln!("  Failed to reset old in-flight pings.");
                 }
