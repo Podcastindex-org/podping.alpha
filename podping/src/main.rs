@@ -268,12 +268,15 @@ async fn main() {
                         capnp::serialize::write_message(&mut send_buffer, &message).unwrap();
 
                         //Fire-and-forget to gossip-writer (if enabled)
+                        println!("Write to gsock...");
                         if let Some(ref gsock) = gossip_socket {
                             if let Err(e) = gsock.send(send_buffer.as_slice(), zmq::DONTWAIT) {
                                 eprintln!("      Gossip write failed (non-fatal): {}", e);
                             }
                         }
+                        println!("Written");
 
+                        println!("Requester send...");
                         match requester.send(send_buffer, 0) {
                             Ok(_) => {
                                 if ephemeral {
@@ -314,6 +317,7 @@ async fn main() {
                                 break;
                             }
                         }
+                        println!("Sent");
 
                         //Again, try to receive any messages waiting on the socket so that we effectively
                         //interleave the receives and sends to speed things up and not have one "block" the other
