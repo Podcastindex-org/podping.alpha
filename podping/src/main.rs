@@ -158,7 +158,7 @@ async fn main() {
                 if gsock.set_sndtimeo(GOSSIP_ZMQ_SEND_TIMEOUT).is_err() {
                     eprintln!("  Failed to set gossip zmq send timeout.");
                 }
-                if gsock.set_rcvtimeo(ZMQ_RECV_TIMEOUT).is_err() {
+                if gsock.set_rcvtimeo(0).is_err() {
                     eprintln!("  Failed to set gossip zmq receive timeout.");
                 }
                 if gsock.set_linger(0).is_err() {
@@ -193,7 +193,7 @@ async fn main() {
             //We always want to try and receive any waiting socket messages before moving on to sending
             receive_messages(&requester);
             if let Some(ref gsock) = gossip_socket {
-                receive_messages(gsock);
+                while receive_messages(gsock) {}
             }
 
             //Get the most recent X number of pings from the queue database
@@ -313,7 +313,7 @@ async fn main() {
                         //interleave the receives and sends to speed things up and not have one "block" the other
                         receive_messages(&requester);
                         if let Some(ref gsock) = gossip_socket {
-                            receive_messages(gsock);
+                            while receive_messages(gsock) {}
                         }
                         sent += 1;
                     }
