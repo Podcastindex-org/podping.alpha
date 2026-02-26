@@ -21,6 +21,10 @@ echo "--- gossip-writer ---"
 cargo build $CARGO_FLAGS --manifest-path "$ROOT/gossip-writer/Cargo.toml"
 
 echo ""
+echo "--- gossip-listener ---"
+cargo build $CARGO_FLAGS --manifest-path "$ROOT/gossip-listener/Cargo.toml"
+
+echo ""
 echo "--- stresser ---"
 cargo build $CARGO_FLAGS --manifest-path "$ROOT/stresser/Cargo.toml"
 
