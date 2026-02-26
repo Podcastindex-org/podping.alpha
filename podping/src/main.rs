@@ -145,7 +145,7 @@ async fn main() {
 
         println!("ZMQ socket: [{}] connected.", zmq_address);
 
-        //Set up gossip-writer PUSH socket (if enabled)
+        //Set up gossip-writer socket (if enabled)
         let gossip_socket: Option<zmq::Socket> = {
             let enabled = std::env::var("GOSSIP_WRITER_ENABLED")
                 .unwrap_or_else(|_| "false".to_string());
@@ -180,6 +180,8 @@ async fn main() {
 
         //Spawn a queue checker threader.  Every X seconds, get all the pings from the Queue and attempt to write them
         //to the socket that the Hive-writer should be listening on
+        //Main queue checker loop
+        let mut total_sent: u64 = 0;
         loop {
             let mut sent = 0;
             let mut loop_start = 0;
@@ -190,11 +192,15 @@ async fn main() {
                 Err(_) => eprintln!("SystemTime before UNIX EPOCH!"),
             }
 
+            println!("-- Total messages sent to writers: [{}]", total_sent);
+
             //We always want to try and receive any waiting socket messages before moving on to sending
+            println!("Receiving messages...");
             receive_messages(&requester);
             if let Some(ref gsock) = gossip_socket {
                 while receive_messages(gsock) {}
             }
+            println!("Received.");
 
             //Get the most recent X number of pings from the queue database
             let pinglist = dbif::get_pings_from_queue(false);
@@ -316,6 +322,7 @@ async fn main() {
                             while receive_messages(gsock) {}
                         }
                         sent += 1;
+                        total_sent += 1;
                     }
                 },
                 Err(e) => {
