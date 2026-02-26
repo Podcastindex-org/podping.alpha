@@ -44,10 +44,10 @@ pub async fn ping(ctx: Context) -> Response {
     //Get the real IP of the connecting client
     match ctx.req.headers().get("cf-connecting-ip") {
         Some(remote_ip) => {
-            println!("\nREQUEST[CloudFlare]: {}", remote_ip.to_str().unwrap());
+            //println!("\nREQUEST[CloudFlare]: {}", remote_ip.to_str().unwrap());
         }
         None => {
-            println!("\nREQUEST: {}", ctx.state.remote_ip);
+            //println!("\nREQUEST: {}", ctx.state.remote_ip);
         }
     }
 
@@ -68,17 +68,17 @@ pub async fn ping(ctx: Context) -> Response {
             let authtest = dbif::check_auth(auth_header.to_str().unwrap());
             match authtest {
                 Ok(authtest) => {
-                    println!("  Publisher: {}", authtest);
+                    //println!("  Publisher: {}", authtest);
                 }
                 Err(e) => {
-                    eprintln!("  Publisher token not found: {}", e);
+                    //eprintln!("  Publisher token not found: {}", e);
                     let authtest2 = dbif::check_auth_hybrid(auth_header.to_str().unwrap());
                     match authtest2 {
                         Ok(authtest2) => {
-                            println!("  Publisher Hybrid: {}", authtest2);
+                            //println!("  Publisher Hybrid: {}", authtest2);
                         }
                         Err(e) => {
-                            eprintln!("  Hybrid token not found: {}", e);
+                            //eprintln!("  Hybrid token not found: {}", e);
                             return hyper::Response::builder()
                                 .status(StatusCode::UNAUTHORIZED)
                                 .body(format!("Bad Authorization header check").into())
@@ -99,7 +99,7 @@ pub async fn ping(ctx: Context) -> Response {
     //Check the user-agent
     match ctx.req.headers().get("user-agent") {
         Some(ua_string) => {
-            println!("  User-Agent: {}", ua_string.to_str().unwrap());
+            //println!("  User-Agent: {}", ua_string.to_str().unwrap());
         }
         None => {
             return hyper::Response::builder()
@@ -114,11 +114,11 @@ pub async fn ping(ctx: Context) -> Response {
     let url_incoming = params.get("url");
     match url_incoming {
         Some(url_incoming) => {
-            println!("  URL: {}", url_incoming);
+            //println!("  URL: {}", url_incoming);
 
             //Make sure the url is not empty
             if url_incoming.len() == 0 {
-                println!("    Url parameter is missing.  Call as /?url=<podcast_url>");
+                //println!("    Url parameter is missing.  Call as /?url=<podcast_url>");
                 return hyper::Response::builder()
                     .status(StatusCode::BAD_REQUEST)
                     .body(format!("Url parameter is missing.  Call as /?url=<podcast_url>").into())
@@ -130,7 +130,7 @@ pub async fn ping(ctx: Context) -> Response {
             match proto_scheme_pos {
                 Some(proto_scheme_pos) => {
                     if proto_scheme_pos != 0 {
-                        println!("Urls must contain a valid protocol schema prefix, like http:// or https://");
+                        //println!("Urls must contain a valid protocol schema prefix, like http:// or https://");
                         return hyper::Response::builder()
                             .status(StatusCode::BAD_REQUEST)
                             .body(format!("Urls must contain a valid protocol schema prefix, like http:// or https://").into())
@@ -138,7 +138,7 @@ pub async fn ping(ctx: Context) -> Response {
                     }
                 }
                 None => {
-                    println!("Urls must contain a valid protocol schema prefix, like http:// or https://");
+                    //println!("Urls must contain a valid protocol schema prefix, like http:// or https://");
                     return hyper::Response::builder()
                         .status(StatusCode::BAD_REQUEST)
                         .body(format!("Urls must contain a valid protocol schema prefix, like http:// or https://").into())
@@ -149,10 +149,10 @@ pub async fn ping(ctx: Context) -> Response {
             //Decode the url if it was percent encoded
             match percent_decode(url_incoming.as_bytes()).decode_utf8() {
                 Ok(result_url) => {
-                    println!("ResultUrl: {}", result_url);
+                    //println!("ResultUrl: {}", result_url);
                 }
                 Err(e) => {
-                    eprintln!("ResultUrlError: {:#?}", e);
+                    //eprintln!("ResultUrlError: {:#?}", e);
                 }
             }
 
@@ -160,7 +160,7 @@ pub async fn ping(ctx: Context) -> Response {
             ping_in.url = url_incoming.clone();
         }
         None => {
-            println!("Url parameter is missing.  Call as /?url=<podcast_url>");
+            //println!("Url parameter is missing.  Call as /?url=<podcast_url>");
             return hyper::Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .body(format!("Url parameter is missing.  Call as /?url=<podcast_url>").into())
@@ -170,7 +170,7 @@ pub async fn ping(ctx: Context) -> Response {
 
     //Check if a reason code exists
     if let Some(reason_incoming) = params.get("reason") {
-        println!("  REASON: {}", reason_incoming);
+        //println!("  REASON: {}", reason_incoming);
 
         //Process the reason
         let reason_code = Reason::from_str(reason_incoming).unwrap();
@@ -181,7 +181,7 @@ pub async fn ping(ctx: Context) -> Response {
 
     //Check if a medium code exists
     if let Some(medium_incoming) = params.get("medium") {
-        println!("  MEDIUM: {}", medium_incoming);
+        //println!("  MEDIUM: {}", medium_incoming);
 
         //Process the reason
         let medium_code = Medium::from_str(medium_incoming).unwrap();
@@ -193,11 +193,11 @@ pub async fn ping(ctx: Context) -> Response {
     //Put the ping in the database
     match dbif::add_ping_to_queue(&ping_in) {
         Ok(_) => {
-            println!("  Added: [{:#?}] to the queue.", ping_in);
-            println!(" ");
+            //println!("  Added: [{:#?}] to the queue.", ping_in);
+            //println!(" ");
         }
         Err(e) => {
-            eprintln!("  Err: {:#?}", e);
+            //eprintln!("  Err: {:#?}", e);
         }
     }
 
@@ -215,17 +215,17 @@ pub async fn publishers(ctx: Context) -> Response {
     //Get the real IP of the connecting client
     match ctx.req.headers().get("cf-connecting-ip") {
         Some(remote_ip) => {
-            println!("\nREQUEST[CloudFlare] - /publishers: {}", remote_ip.to_str().unwrap());
+            //println!("\nREQUEST[CloudFlare] - /publishers: {}", remote_ip.to_str().unwrap());
         }
         None => {
-            println!("\nREQUEST - /publishers: {}", ctx.state.remote_ip);
+            //println!("\nREQUEST - /publishers: {}", ctx.state.remote_ip);
         }
     }
 
     //Check the user-agent
     match ctx.req.headers().get("user-agent") {
         Some(ua_string) => {
-            println!("  User-Agent: {}", ua_string.to_str().unwrap());
+            //println!("  User-Agent: {}", ua_string.to_str().unwrap());
         }
         None => {
             return hyper::Response::builder()
