@@ -48,7 +48,7 @@ impl PeerAnnounce {
 // Notification types (self-contained copy matching gossip-writer)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct GossipNotification {
     version: String,
     sender: String,
@@ -290,20 +290,16 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId) {
 
 fn print_notification(notif: &GossipNotification) {
     let sig_status = match notif.verify_signature() {
-        Ok(true) => "VALID".to_string(),
-        Ok(false) => "UNSIGNED".to_string(),
-        Err(e) => format!("INVALID ({e})"),
+        Ok(true) => "VALID",
+        Ok(false) => "UNSIGNED",
+        Err(_) => "INVALID",
     };
 
-    println!("--- Notification ---");
-    println!("  version:   {}", notif.version);
-    println!("  sender:    {}", notif.sender);
-    println!("  timestamp: {}", notif.timestamp);
-    println!("  medium:    {}", notif.medium);
-    println!("  reason:    {}", notif.reason);
-    println!("  iris:      {:?}", notif.iris);
-    println!("  signature: {}", sig_status);
-    println!();
+    let mut json = serde_json::to_value(notif).unwrap_or_default();
+    if let Some(obj) = json.as_object_mut() {
+        obj.insert("sig_status".to_string(), serde_json::Value::String(sig_status.to_string()));
+    }
+    println!("{}", serde_json::to_string(&json).unwrap_or_default());
 }
 
 /// Load known peers from a text file (one NodeId per line).
