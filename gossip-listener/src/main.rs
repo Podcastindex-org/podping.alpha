@@ -254,7 +254,7 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId) {
             // Try PeerAnnounce first
             if let Ok(announce) = serde_json::from_slice::<PeerAnnounce>(raw) {
                 if announce.msg_type == "peer_announce" {
-                    println!("[ANNOUNCE] PeerAnnounce from {} v{}", announce.node_id, announce.version);
+                    println!("\x1b[33m[ANNOUNCE] PeerAnnounce from {} v{}\x1b[0m", announce.node_id, announce.version);
                     if let Ok(node_id) = announce.node_id.parse() {
                         save_peer_if_new(peers_file, &node_id, my_node_id);
                     }
@@ -265,7 +265,7 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId) {
                     Ok(notif) => print_notification(&notif),
                     Err(e) => {
                         eprintln!(
-                            "[WARN] failed to parse notification: {e}\n  raw: {}",
+                            "\x1b[35m[WARN] failed to parse notification: {e}\n  raw: {}\x1b[0m",
                             String::from_utf8_lossy(raw)
                         );
                     }
@@ -273,14 +273,14 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId) {
             }
         }
         Event::NeighborUp(node_id) => {
-            println!("[EVENT] NeighborUp: {node_id}");
+            println!("\x1b[32m[EVENT] NeighborUp: {node_id}\x1b[0m");
             save_peer_if_new(peers_file, &node_id, my_node_id);
         }
         Event::NeighborDown(node_id) => {
-            println!("[EVENT] NeighborDown: {node_id}");
+            println!("\x1b[31m[EVENT] NeighborDown: {node_id}\x1b[0m");
         }
         Event::Lagged => {
-            eprintln!("[WARN] lagged — missed some messages");
+            eprintln!("\x1b[35m[WARN] lagged — missed some messages\x1b[0m");
         }
     }
 }
