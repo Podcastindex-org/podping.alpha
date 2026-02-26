@@ -2,12 +2,17 @@ use rusqlite::{params, Connection};
 use std::error::Error;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+//##: ----------------------------------------------------------------------------------------------
+//##: Warning:  This archive feature is totally exprimental right now.  It will probably move 
+//##: into a different module and be called directly from podping instead of inside of a writer
+//##: ----------------------------------------------------------------------------------------------
+
 pub struct Archive {
     conn: Connection,
 }
 
 impl Archive {
-    /// Open (or create) the SQLite archive at the given path.
+    // Open (or create) the SQLite archive at the given path.
     pub fn open(path: &str) -> Result<Self, Box<dyn Error>> {
         let conn = Connection::open(path)?;
 
@@ -32,8 +37,8 @@ impl Archive {
         Ok(Archive { conn })
     }
 
-    /// Store a notification payload, deduplicating by its blake3 content hash.
-    /// Returns `true` if the row was newly inserted, `false` if it already existed.
+    // Store a notification payload, deduplicating by its blake3 content hash.
+    // Returns `true` if the row was newly inserted, `false` if it already existed.
     pub fn store(
         &self,
         payload: &[u8],

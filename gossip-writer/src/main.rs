@@ -7,6 +7,7 @@ use iroh_gossip::net::Gossip;
 use iroh_gossip::api::Event;
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -320,8 +321,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Process a single ZMQ message: deserialize Cap'n Proto, build notification,
-/// sign, archive, and send to the broadcast channel.
+// Process a single ZMQ message: deserialize Cap'n Proto, build notification,
+// sign, archive, and send to the broadcast channel.
 fn process_message(
     msg: &zmq::Message,
     signing_key: &ed25519_dalek::SigningKey,
@@ -441,8 +442,8 @@ fn process_message(
     Ok(())
 }
 
-/// Load known peers from a text file (one NodeId per line).
-/// Returns an empty vec if the file doesn't exist or can't be read.
+// Load known peers from a text file (one NodeId per line).
+// Returns an empty vec if the file doesn't exist or can't be read.
 fn load_known_peers(path: &str) -> Vec<iroh::EndpointId> {
     let contents = match fs::read_to_string(path) {
         Ok(c) => c,
@@ -455,9 +456,9 @@ fn load_known_peers(path: &str) -> Vec<iroh::EndpointId> {
         .collect()
 }
 
-/// Save a peer's NodeId to the known-peers file if it's not already present
-/// and not our own node ID. Caps the file at MAX_KNOWN_PEERS entries,
-/// evicting the oldest (first) entries when full.
+// Save a peer's NodeId to the known-peers file if it's not already present
+// and not our own node ID. Caps the file at MAX_KNOWN_PEERS entries,
+// evicting the oldest (first) entries when full.
 const MAX_KNOWN_PEERS: usize = 15;
 
 fn save_peer_if_new(path: &str, node_id: &iroh::EndpointId, my_node_id: &iroh::EndpointId) {
@@ -484,7 +485,6 @@ fn save_peer_if_new(path: &str, node_id: &iroh::EndpointId, my_node_id: &iroh::E
         peers.drain(..drain_count);
     }
 
-    use std::io::Write;
     if let Some(parent) = Path::new(path).parent() {
         if !parent.as_os_str().is_empty() {
             let _ = fs::create_dir_all(parent);
@@ -498,7 +498,7 @@ fn save_peer_if_new(path: &str, node_id: &iroh::EndpointId, my_node_id: &iroh::E
     }
 }
 
-/// Load a persistent iroh node key from `path`, or generate a new one and save it.
+// Load a persistent iroh node key from `path`, or generate a new one and save it.
 fn load_or_create_node_key(path: &str) -> Result<SecretKey, Box<dyn std::error::Error>> {
     if Path::new(path).exists() {
         let raw = fs::read(path)?;
