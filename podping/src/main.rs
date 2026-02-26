@@ -254,6 +254,7 @@ async fn main() {
                             Medium::CourseL => pp_medium = podping_medium_capnp::PodpingMedium::CourseL,
                         }
                         podping_write.set_medium(pp_medium);
+                        println!("PPmedium: {:#?}", pp_medium.clone());
 
                         //Create a raw buffer that will hold the plexo wrapper
                         let mut write_message_buffer = Vec::new();
