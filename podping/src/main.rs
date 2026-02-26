@@ -136,6 +136,9 @@ async fn main() {
         if requester.set_rcvtimeo(ZMQ_RECV_TIMEOUT).is_err() {
             eprintln!("  Failed to set zmq receive timeout.");
         }
+        if requester.set_sndtimeo(1000).is_err() {
+            eprintln!("  Failed to set zmq send timeout.");
+        }
         if requester.set_linger(0).is_err() {
             eprintln!("  Failed to set zmq to zero linger.");
         }
@@ -307,6 +310,9 @@ async fn main() {
                                 requester = context.socket(zmq::PAIR).unwrap();
                                 if requester.set_rcvtimeo(ZMQ_RECV_TIMEOUT).is_err() {
                                     eprintln!("      Failed to set zmq receive timeout.");
+                                }
+                                if requester.set_sndtimeo(1000).is_err() {
+                                    eprintln!("      Failed to set zmq send timeout.");
                                 }
                                 if requester.set_linger(0).is_err() {
                                     eprintln!("      Failed to set zmq to zero linger.");
