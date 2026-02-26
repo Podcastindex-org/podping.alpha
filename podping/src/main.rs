@@ -317,10 +317,13 @@ async fn main() {
 
                         //Again, try to receive any messages waiting on the socket so that we effectively
                         //interleave the receives and sends to speed things up and not have one "block" the other
+                        println!("Receive[2] messages...");
                         receive_messages(&requester);
                         if let Some(ref gsock) = gossip_socket {
                             while receive_messages(gsock) {}
                         }
+                        println!("Received[2]");
+
                         sent += 1;
                         total_sent += 1;
                     }
