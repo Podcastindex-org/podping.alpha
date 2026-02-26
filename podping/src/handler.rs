@@ -71,14 +71,14 @@ pub async fn ping(ctx: Context) -> Response {
                     println!("  Publisher: {}", authtest);
                 }
                 Err(e) => {
-                    //eprintln!("  Publisher token not found: {}", e);
+                    eprintln!("  Publisher token not found: {}", e);
                     let authtest2 = dbif::check_auth_hybrid(auth_header.to_str().unwrap());
                     match authtest2 {
                         Ok(authtest2) => {
                             println!("  Publisher Hybrid: {}", authtest2);
                         }
                         Err(e) => {
-                            //eprintln!("  Hybrid token not found: {}", e);
+                            eprintln!("  Hybrid token not found: {}", e);
                             return hyper::Response::builder()
                                 .status(StatusCode::UNAUTHORIZED)
                                 .body(format!("Bad Authorization header check").into())
@@ -152,7 +152,7 @@ pub async fn ping(ctx: Context) -> Response {
                     println!("ResultUrl: {}", result_url);
                 }
                 Err(e) => {
-                    //eprintln!("ResultUrlError: {:#?}", e);
+                    eprintln!("ResultUrlError: {:#?}", e);
                 }
             }
 
@@ -197,7 +197,7 @@ pub async fn ping(ctx: Context) -> Response {
             println!(" ");
         }
         Err(e) => {
-            //eprintln!("  Err: {:#?}", e);
+            eprintln!("  Err: {:#?}", e);
         }
     }
 
