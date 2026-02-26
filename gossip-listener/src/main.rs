@@ -2,7 +2,7 @@ use std::env;
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
-
+use std::io::Write;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use iroh::protocol::Router;
 use iroh::SecretKey;
@@ -14,12 +14,14 @@ use distributed_topic_tracker::{AutoDiscoveryGossip, RecordPublisher, TopicId as
 const TOPIC_STRING: &str = "gossipping/v1/all";
 const DEFAULT_NODE_KEY_FILE: &str = "gossip_listener_node.key";
 const DEFAULT_KNOWN_PEERS_FILE: &str = "gossip_listener_known_peers.txt";
+const MAX_KNOWN_PEERS: usize = 15;
 const DEFAULT_DHT_SECRET: &str = "podping_gossip_default_secret";
 
-// ---------------------------------------------------------------------------
-// PeerAnnounce: periodic node ID announcement over gossip
-// ---------------------------------------------------------------------------
+//Structs ------------------------------------------------------------------------------------------
 
+// PeerAnnounce: periodic node ID announcement over gossip so that other nodes
+// have a chance to see who is connected to the topic and save those as
+// bootstrap nodes for later use
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PeerAnnounce {
     #[serde(rename = "type")]
@@ -28,7 +30,6 @@ struct PeerAnnounce {
     version: String,
     timestamp: u64,
 }
-
 impl PeerAnnounce {
     fn new(node_id: &str, version: &str) -> Self {
         let timestamp = SystemTime::now()
@@ -44,10 +45,7 @@ impl PeerAnnounce {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Notification types (self-contained copy matching gossip-writer)
-// ---------------------------------------------------------------------------
-
+//GossipNotification to match existing writer format
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct GossipNotification {
     version: String,
@@ -59,7 +57,7 @@ struct GossipNotification {
     signature: Option<String>,
 }
 
-/// Canonical form with fields in alphabetical order for signature verification.
+// Canonical form with fields in alphabetical order for signature verification
 #[derive(Debug, Serialize)]
 struct CanonicalNotification<'a> {
     iris: &'a Vec<String>,
@@ -111,15 +109,12 @@ impl GossipNotification {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
-
+//Main ---------------------------------------------------------------------------------------------
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     println!("=== Gossip Listener ===\n");
 
-    // --- Config from env vars ---
+    // Configure from the environment
     let bootstrap_peer_ids_str = env::var("BOOTSTRAP_PEER_IDS").unwrap_or_default();
     let node_key_file =
         env::var("IROH_NODE_KEY_FILE").unwrap_or_else(|_| DEFAULT_NODE_KEY_FILE.to_string());
@@ -131,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
     println!("  Topic: \"{}\"", TOPIC_STRING);
     println!("  DHT discovery: enabled");
 
-    // --- Set up Iroh endpoint and gossip ---
+    //Set up Iroh context
     let node_key = load_or_create_node_key(&node_key_file)?;
     let node_key_bytes = node_key.to_bytes();
     let endpoint = iroh::Endpoint::builder()
@@ -139,22 +134,22 @@ async fn main() -> anyhow::Result<()> {
         .bind()
         .await?;
 
+    //Self assign an Iroh node id
     let my_node_id = endpoint.id();
     println!("  Iroh Node ID: {}", my_node_id);
 
+    //Launch Iroh modules
     let gossip = Gossip::builder()
         .max_message_size(65536)
         .spawn(endpoint.clone());
-
     let _router = Router::builder(endpoint.clone())
         .accept(iroh_gossip::ALPN, gossip.clone())
         .spawn();
 
-    // --- DHT auto-discovery: subscribe to topic ---
+    // Bootstrap this node over DHT
     let dht_signing_key = ed25519_dalek::SigningKey::from_bytes(&node_key_bytes);
     let dtt_topic_id = DttTopicId::new(TOPIC_STRING.to_string());
     println!("  Topic ID: {}", hex::encode(dtt_topic_id.hash()));
-
     let record_publisher = RecordPublisher::new(
         dtt_topic_id,
         dht_signing_key.verifying_key(),
@@ -169,7 +164,7 @@ async fn main() -> anyhow::Result<()> {
     let (gossip_sender, gossip_receiver) = topic.split().await?;
     println!("  Joined gossip topic with DHT auto-discovery.");
 
-    // --- Optionally join bootstrap peers ---
+    //Joining peers from the known peers file serves as fallback/insurance if DHT no work
     let mut bootstrap_peers: Vec<iroh::EndpointId> = bootstrap_peer_ids_str
         .split(',')
         .filter(|s| !s.trim().is_empty())
@@ -192,7 +187,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // --- Periodic PeerAnnounce task ---
+    //Periodically announce ourselves to the topic for the bootstrapping benefit of others
     let peer_announce_interval: u64 = env::var("PEER_ANNOUNCE_INTERVAL")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -220,12 +215,13 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    println!("\n  Listening for gossip notifications...\n");
+    println!(
+        "\n  Listening for gossip notifications. This will take a minute. Patience grasshopper...\n"
+    );
 
-    // --- Receive loop with Ctrl+C handling ---
+    // Main receive loop.  CTRL+C to close
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
-
     loop {
         tokio::select! {
             item = gossip_receiver.next() => {
@@ -250,6 +246,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+//Incoming Iroh gossip event handler
 fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId) {
     match event {
         Event::Received(msg) => {
@@ -288,6 +285,7 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId) {
     }
 }
 
+//Pretty print messages
 fn print_notification(notif: &GossipNotification) {
     let sig_status = match notif.verify_signature() {
         Ok(true) => "VALID",
@@ -302,8 +300,8 @@ fn print_notification(notif: &GossipNotification) {
     println!("{}", serde_json::to_string(&json).unwrap_or_default());
 }
 
-/// Load known peers from a text file (one NodeId per line).
-/// Returns an empty vec if the file doesn't exist or can't be read.
+// Load known peers from a text file
+// Returns an empty vec if the file doesn't exist or can't be read
 fn load_known_peers(path: &str) -> Vec<iroh::EndpointId> {
     let contents = match fs::read_to_string(path) {
         Ok(c) => c,
@@ -316,11 +314,7 @@ fn load_known_peers(path: &str) -> Vec<iroh::EndpointId> {
         .collect()
 }
 
-/// Save a peer's NodeId to the known-peers file if it's not already present
-/// and not our own node ID. Caps the file at MAX_KNOWN_PEERS entries,
-/// evicting the oldest (first) entries when full.
-const MAX_KNOWN_PEERS: usize = 15;
-
+// Save a peer's NodeId to the known-peers file if it's not already present
 fn save_peer_if_new(path: &str, node_id: &iroh::EndpointId, my_node_id: &iroh::EndpointId) {
     if node_id == my_node_id {
         return;
@@ -339,13 +333,12 @@ fn save_peer_if_new(path: &str, node_id: &iroh::EndpointId, my_node_id: &iroh::E
 
     peers.push(node_str.clone());
 
-    // Evict oldest entries if over the cap
+    // Evict oldest entries if over the max cap
     if peers.len() > MAX_KNOWN_PEERS {
         let drain_count = peers.len() - MAX_KNOWN_PEERS;
         peers.drain(..drain_count);
     }
 
-    use std::io::Write;
     if let Some(parent) = Path::new(path).parent() {
         if !parent.as_os_str().is_empty() {
             let _ = fs::create_dir_all(parent);
@@ -359,7 +352,7 @@ fn save_peer_if_new(path: &str, node_id: &iroh::EndpointId, my_node_id: &iroh::E
     }
 }
 
-/// Load a persistent iroh node key from `path`, or generate a new one and save it.
+// Load a persistent iroh node key from `path` or generate a new one and save it.
 fn load_or_create_node_key(path: &str) -> anyhow::Result<SecretKey> {
     if Path::new(path).exists() {
         let raw = fs::read(path)?;
