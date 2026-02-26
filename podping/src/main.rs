@@ -130,26 +130,27 @@ async fn main() {
             println!(" - Trying localhost default: [{}].", zmq_address);
         }
 
-        //Set up and connect the socket
+        //Create a ZMQ socket context
         let context = zmq::Context::new();
-        let mut requester = context.socket(zmq::PAIR).unwrap();
-        if requester.set_rcvtimeo(ZMQ_RECV_TIMEOUT).is_err() {
+
+        //Create the socket for the hive-writer
+        let mut zmq_hive = context.socket(zmq::PAIR).unwrap();
+        if zmq_hive.set_rcvtimeo(ZMQ_RECV_TIMEOUT).is_err() {
             eprintln!("  Failed to set zmq receive timeout.");
         }
-        if requester.set_sndtimeo(1000).is_err() {
+        if zmq_hive.set_sndtimeo(1000).is_err() {
             eprintln!("  Failed to set zmq send timeout.");
         }
-        if requester.set_linger(0).is_err() {
+        if zmq_hive.set_linger(0).is_err() {
             eprintln!("  Failed to set zmq to zero linger.");
         }
-        if requester.connect(&zmq_address).is_err() {
+        if zmq_hive.connect(&zmq_address).is_err() {
             eprintln!("  Failed to connect to the podping writer socket.");
         }
-
         println!("ZMQ socket: [{}] connected.", zmq_address);
 
-        //Set up gossip-writer socket (if enabled)
-        let gossip_socket: Option<zmq::Socket> = {
+        //Create the socket for the gossip-writer (if enabled)
+        let zmq_gossip: Option<zmq::Socket> = {
             let enabled = std::env::var("GOSSIP_WRITER_ENABLED")
                 .unwrap_or_else(|_| "false".to_string());
             if enabled.eq_ignore_ascii_case("true") || enabled == "1" {
@@ -197,13 +198,12 @@ async fn main() {
 
             println!("-- Total messages sent to writers: [{}]", total_sent);
 
-            //We always want to try and receive any waiting socket messages before moving on to sending
-            println!("Receiving messages...");
-            receive_messages(&requester);
-            if let Some(ref gsock) = gossip_socket {
+            //We always want to try and receive any waiting socket messages before moving on to
+            // sending. Both sockets should be given a chance
+            receive_messages(&zmq_hive);
+            if let Some(ref gsock) = zmq_gossip {
                 while receive_messages(gsock) {}
             }
-            println!("Received.");
 
             //Get the most recent X number of pings from the queue database
             let pinglist = dbif::get_pings_from_queue(false);
@@ -254,7 +254,6 @@ async fn main() {
                             Medium::CourseL => pp_medium = podping_medium_capnp::PodpingMedium::CourseL,
                         }
                         podping_write.set_medium(pp_medium);
-                        println!("PPmedium: {:#?}", pp_medium.clone());
 
                         //Create a raw buffer that will hold the plexo wrapper
                         let mut write_message_buffer = Vec::new();
@@ -267,21 +266,19 @@ async fn main() {
                         let podping_write_reader = Reader::from(write_message_buffer.as_slice());
                         plexo_message.set_payload(podping_write_reader);
 
-                        //Attempt to send the message over the ZMQ socket
+                        //Write the capnp structured message to the send buffer
                         let mut send_buffer = Vec::new();
                         capnp::serialize::write_message(&mut send_buffer, &message).unwrap();
 
-                        //Fire-and-forget to gossip-writer (if enabled)
-                        println!("Write to gsock...");
-                        if let Some(ref gsock) = gossip_socket {
+                        //Send the message to the gossip-writer (if enabled)
+                        if let Some(ref gsock) = zmq_gossip {
                             if let Err(e) = gsock.send(send_buffer.as_slice(), zmq::DONTWAIT) {
-                                eprintln!("      Gossip write failed (non-fatal): {}", e);
+                                eprintln!("      Gossip write failed: [{}]", e);
                             }
                         }
-                        println!("Written");
 
-                        println!("Requester send...");
-                        match requester.send(send_buffer, 0) {
+                        //Send the message to the hive-writer
+                        match zmq_hive.send(send_buffer, 0) {
                             Ok(_) => {
                                 if ephemeral {
                                     //In ephemeral mode, remove the IRI from the queue immediately
@@ -305,35 +302,32 @@ async fn main() {
                             },
                             Err(e) => {
                                 eprintln!("      {}", e);
-                                if requester.disconnect(&zmq_address).is_err() {
+                                if zmq_hive.disconnect(&zmq_address).is_err() {
                                     eprintln!("      Failed to disconnect zmq socket.");
                                 }
-                                requester = context.socket(zmq::PAIR).unwrap();
-                                if requester.set_rcvtimeo(ZMQ_RECV_TIMEOUT).is_err() {
+                                zmq_hive = context.socket(zmq::PAIR).unwrap();
+                                if zmq_hive.set_rcvtimeo(ZMQ_RECV_TIMEOUT).is_err() {
                                     eprintln!("      Failed to set zmq receive timeout.");
                                 }
-                                if requester.set_sndtimeo(1000).is_err() {
+                                if zmq_hive.set_sndtimeo(1000).is_err() {
                                     eprintln!("      Failed to set zmq send timeout.");
                                 }
-                                if requester.set_linger(0).is_err() {
+                                if zmq_hive.set_linger(0).is_err() {
                                     eprintln!("      Failed to set zmq to zero linger.");
                                 }
-                                if requester.connect(&zmq_address).is_err() {
+                                if zmq_hive.connect(&zmq_address).is_err() {
                                     eprintln!("      Failed to re-connect to the hive-writer socket.");
                                 }
                                 break;
                             }
                         }
-                        println!("Sent");
 
                         //Again, try to receive any messages waiting on the socket so that we effectively
                         //interleave the receives and sends to speed things up and not have one "block" the other
-                        println!("Receive[2] messages...");
-                        receive_messages(&requester);
-                        if let Some(ref gsock) = gossip_socket {
+                        receive_messages(&zmq_hive);
+                        if let Some(ref gsock) = zmq_gossip {
                             while receive_messages(gsock) {}
                         }
-                        println!("Received[2]");
 
                         sent += 1;
                         total_sent += 1;
