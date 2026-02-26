@@ -78,7 +78,7 @@ impl GossipNotification {
             timestamp: self.timestamp,
             version: &self.version,
         };
-        serde_json::to_vec(&canonical).expect("canonical JSON serialization should not fail")
+        serde_json::to_vec(&canonical).expect("Canonical JSON serialization should not fail")
     }
 
     fn verify_signature(&self) -> Result<bool, String> {
@@ -88,23 +88,23 @@ impl GossipNotification {
         };
 
         let pubkey_bytes: [u8; 32] = hex::decode(&self.sender)
-            .map_err(|e| format!("bad sender hex: {e}"))?
+            .map_err(|e| format!("Bad sender hex: {e}"))?
             .try_into()
-            .map_err(|_| "sender is not 32 bytes".to_string())?;
+            .map_err(|_| "Sender is not 32 bytes".to_string())?;
 
         let sig_bytes: [u8; 64] = hex::decode(sig_hex)
-            .map_err(|e| format!("bad signature hex: {e}"))?
+            .map_err(|e| format!("Bad signature hex: {e}"))?
             .try_into()
-            .map_err(|_| "signature is not 64 bytes".to_string())?;
+            .map_err(|_| "Signature is not 64 bytes".to_string())?;
 
         let verifying_key =
-            VerifyingKey::from_bytes(&pubkey_bytes).map_err(|e| format!("bad pubkey: {e}"))?;
+            VerifyingKey::from_bytes(&pubkey_bytes).map_err(|e| format!("Bad pubkey: {e}"))?;
         let signature = Signature::from_bytes(&sig_bytes);
 
         let canonical = self.canonical_bytes();
         match verifying_key.verify(&canonical, &signature) {
             Ok(()) => Ok(true),
-            Err(e) => Err(format!("signature verification failed: {e}")),
+            Err(e) => Err(format!("Signature verification failed: {e}")),
         }
     }
 }
@@ -112,7 +112,7 @@ impl GossipNotification {
 //Main ---------------------------------------------------------------------------------------------
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    println!("=== Gossip Listener ===\n");
+    println!("--- Podping Gossip Listener ---\n");
 
     // Configure from the environment
     let bootstrap_peer_ids_str = env::var("BOOTSTRAP_PEER_IDS").unwrap_or_default();
@@ -254,7 +254,7 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId) {
             // Try PeerAnnounce first
             if let Ok(announce) = serde_json::from_slice::<PeerAnnounce>(raw) {
                 if announce.msg_type == "peer_announce" {
-                    println!("[info] PeerAnnounce from {} v{}", announce.node_id, announce.version);
+                    println!("[ANNOUNCE] PeerAnnounce from {} v{}", announce.node_id, announce.version);
                     if let Ok(node_id) = announce.node_id.parse() {
                         save_peer_if_new(peers_file, &node_id, my_node_id);
                     }
@@ -265,7 +265,7 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId) {
                     Ok(notif) => print_notification(&notif),
                     Err(e) => {
                         eprintln!(
-                            "[warn] failed to parse notification: {e}\n  raw: {}",
+                            "[WARN] failed to parse notification: {e}\n  raw: {}",
                             String::from_utf8_lossy(raw)
                         );
                     }
@@ -273,14 +273,14 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId) {
             }
         }
         Event::NeighborUp(node_id) => {
-            println!("[event] NeighborUp: {node_id}");
+            println!("[EVENT] NeighborUp: {node_id}");
             save_peer_if_new(peers_file, &node_id, my_node_id);
         }
         Event::NeighborDown(node_id) => {
-            println!("[event] NeighborDown: {node_id}");
+            println!("[EVENT] NeighborDown: {node_id}");
         }
         Event::Lagged => {
-            eprintln!("[warn] lagged — missed some messages");
+            eprintln!("[WARN] lagged — missed some messages");
         }
     }
 }
@@ -297,7 +297,7 @@ fn print_notification(notif: &GossipNotification) {
     if let Some(obj) = json.as_object_mut() {
         obj.insert("sig_status".to_string(), serde_json::Value::String(sig_status.to_string()));
     }
-    println!("{}", serde_json::to_string(&json).unwrap_or_default());
+    println!("PODPING: [{}]", serde_json::to_string(&json).unwrap_or_default());
 }
 
 // Load known peers from a text file
