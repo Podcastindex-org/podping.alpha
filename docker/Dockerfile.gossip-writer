@@ -6,10 +6,10 @@ USER root
 RUN apt-get update && apt-get install -y apt-utils sqlite3 openssl capnproto libzmq3-dev ca-certificates && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt
-ARG GIT_REPO=https://github.com/Podcastindex-org/podping.cloud.git
+ARG GIT_REPO=https://github.com/Podcastindex-org/podping.alpha.git
 ARG GIT_BRANCH=main
 RUN git clone --depth 1 -b ${GIT_BRANCH} ${GIT_REPO}
-WORKDIR /opt/podping.cloud/gossip-writer
+WORKDIR /opt/podping.alpha/gossip-writer
 RUN cargo build --release
 RUN cp target/release/gossip-writer .
 
@@ -28,6 +28,6 @@ USER 1000
 RUN mkdir /opt/gossip-writer
 
 WORKDIR /opt/gossip-writer
-COPY --from=builder /opt/podping.cloud/gossip-writer/target/release/gossip-writer .
+COPY --from=builder /opt/podping.alpha/gossip-writer/target/release/gossip-writer .
 
-ENTRYPOINT ["/opt/gossip-writer/gossip-writer"]
+ENTRYPOINT ["/opt/gossip-alpha/gossip-writer"]

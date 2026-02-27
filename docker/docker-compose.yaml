@@ -2,7 +2,7 @@ version: "3.7"
 
 services:
   podping-cloud:
-    image: podcastindexorg/podcasting20-podping.alpha/frontend:0.1.0
+    image: podcastindexorg/podcasting20-podping.alpha/frontend:3.0.0
     init: true
     restart: unless-stopped
     stop_grace_period: 1m
@@ -41,7 +41,7 @@ services:
         tag: "{{.ImageName}}/{{.Name}}/{{.ID}}"
 
   gossip-writer:
-    image: podcastindexorg/podcasting20-podping.alpha/gossip-writer:0.1.0
+    image: podcastindexorg/podcasting20-podping.alpha/gossip-writer:0.1.1
     init: true
     restart: unless-stopped
     stop_grace_period: 30s
