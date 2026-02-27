@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y apt-utils sqlite3 openssl capnproto lib
 
 WORKDIR /opt
 ARG GIT_REPO=https://github.com/Podcastindex-org/podping.alpha.git
-ARG GIT_BRANCH=main
+ARG GIT_BRANCH=master
 RUN git clone --depth 1 -b ${GIT_BRANCH} ${GIT_REPO}
 WORKDIR /opt/podping.alpha/podping
 RUN cargo build --release
