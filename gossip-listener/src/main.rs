@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -16,6 +17,7 @@ const DEFAULT_NODE_KEY_FILE: &str = "gossip_listener_node.key";
 const DEFAULT_KNOWN_PEERS_FILE: &str = "gossip_listener_known_peers.txt";
 const MAX_KNOWN_PEERS: usize = 15;
 const DEFAULT_DHT_SECRET: &str = "podping_gossip_default_secret";
+const DEFAULT_TRUSTED_PUBLISHERS_FILE: &str = "trusted_publishers.txt";
 
 //Structs ------------------------------------------------------------------------------------------
 
@@ -122,9 +124,19 @@ async fn main() -> anyhow::Result<()> {
         env::var("KNOWN_PEERS_FILE").unwrap_or_else(|_| DEFAULT_KNOWN_PEERS_FILE.to_string());
     let dht_initial_secret = env::var("DHT_INITIAL_SECRET")
         .unwrap_or_else(|_| DEFAULT_DHT_SECRET.to_string());
+    let trusted_peers_file =
+        env::var("TRUSTED_PUBLISHERS_FILE").unwrap_or_else(|_| DEFAULT_TRUSTED_PUBLISHERS_FILE.to_string());
+
+    let trusted_publishers = load_trusted_publishers(&trusted_peers_file);
 
     println!("  Topic: \"{}\"", TOPIC_STRING);
     println!("  DHT discovery: enabled");
+    println!("  Trusted publishers file: {}", trusted_peers_file);
+    if trusted_publishers.is_empty() {
+        println!("  Trusted publisher filter: disabled (accepting all)");
+    } else {
+        println!("  Trusted publisher filter: {} senders", trusted_publishers.len());
+    }
 
     //Set up Iroh context
     let node_key = load_or_create_node_key(&node_key_file)?;
@@ -226,7 +238,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             item = gossip_receiver.next() => {
                 match item {
-                    Some(Ok(event)) => handle_event(event, &peers_file, &my_node_id),
+                    Some(Ok(event)) => handle_event(event, &peers_file, &my_node_id, &trusted_publishers),
                     Some(Err(e)) => eprintln!("[error] gossip stream error: {e}"),
                     None => {
                         println!("[info] gossip stream ended");
@@ -247,7 +259,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 //Incoming Iroh gossip event handler
-fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId) {
+fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, trusted_peers: &HashSet<String>) {
     match event {
         Event::Received(msg) => {
             let raw = &msg.content[..];
@@ -262,7 +274,11 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId) {
             } else {
                 // Fall back to GossipNotification
                 match serde_json::from_slice::<GossipNotification>(raw) {
-                    Ok(notif) => print_notification(&notif),
+                    Ok(notif) => {
+                        if trusted_peers.is_empty() || trusted_peers.contains(&notif.sender) {
+                            print_notification(&notif);
+                        }
+                    }
                     Err(e) => {
                         eprintln!(
                             "\x1b[35m[WARN] failed to parse notification: {e}\n  raw: {}\x1b[0m",
@@ -300,8 +316,22 @@ fn print_notification(notif: &GossipNotification) {
     println!("PODPING: [{}]", serde_json::to_string(&json).unwrap_or_default());
 }
 
-// Load known peers from a text file
-// Returns an empty vec if the file doesn't exist or can't be read
+//Load trusted sender public keys from the trusted sender file
+//Returns empty HashSet if the file doesn't exist or is empty
+fn load_trusted_publishers(path: &str) -> HashSet<String> {
+    let contents = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return HashSet::new(),
+    };
+    contents
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+//Load known peers from a text file
+//Returns an empty vec if the file doesn't exist or is empty
 fn load_known_peers(path: &str) -> Vec<iroh::EndpointId> {
     let contents = match fs::read_to_string(path) {
         Ok(c) => c,
@@ -314,7 +344,7 @@ fn load_known_peers(path: &str) -> Vec<iroh::EndpointId> {
         .collect()
 }
 
-// Save a peer's NodeId to the known-peers file if it's not already present
+//Save a peer's NodeId to the known-peers file if it's not already in there
 fn save_peer_if_new(path: &str, node_id: &iroh::EndpointId, my_node_id: &iroh::EndpointId) {
     if node_id == my_node_id {
         return;
@@ -333,7 +363,7 @@ fn save_peer_if_new(path: &str, node_id: &iroh::EndpointId, my_node_id: &iroh::E
 
     peers.push(node_str.clone());
 
-    // Evict oldest entries if over the max cap
+    //Evict oldest entries if over the max cap
     if peers.len() > MAX_KNOWN_PEERS {
         let drain_count = peers.len() - MAX_KNOWN_PEERS;
         peers.drain(..drain_count);
@@ -352,7 +382,8 @@ fn save_peer_if_new(path: &str, node_id: &iroh::EndpointId, my_node_id: &iroh::E
     }
 }
 
-// Load a persistent iroh node key from `path` or generate a new one and save it.
+//Load a persistent iroh node key from `path` or generate a new one and save it
+//So we can be the same node identity every time
 fn load_or_create_node_key(path: &str) -> anyhow::Result<SecretKey> {
     if Path::new(path).exists() {
         let raw = fs::read(path)?;
@@ -363,7 +394,7 @@ fn load_or_create_node_key(path: &str) -> anyhow::Result<SecretKey> {
                 return Ok(key);
             }
         }
-        // Fall back to raw 32-byte format
+        //Fall back to raw 32-byte format
         let key_bytes: [u8; 32] = raw.try_into()
             .map_err(|_| anyhow::anyhow!("key file {} has invalid length", path))?;
         println!("  Loaded iroh node key from {}", path);
