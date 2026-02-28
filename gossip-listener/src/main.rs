@@ -2,9 +2,10 @@ use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::io::Write;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use iroh::protocol::Router;
 use iroh::SecretKey;
 use iroh_gossip::api::Event;
@@ -18,12 +19,14 @@ const DEFAULT_KNOWN_PEERS_FILE: &str = "gossip_listener_known_peers.txt";
 const MAX_KNOWN_PEERS: usize = 15;
 const DEFAULT_DHT_SECRET: &str = "podping_gossip_default_secret";
 const DEFAULT_TRUSTED_PUBLISHERS_FILE: &str = "trusted_publishers.txt";
+const DEFAULT_PEER_ENDORSE_INTERVAL: u64 = 45;
 
 //Structs ------------------------------------------------------------------------------------------
 
 // PeerAnnounce: periodic node ID announcement over gossip so that other nodes
 // have a chance to see who is connected to the topic and save those as
-// bootstrap nodes for later use
+// bootstrap nodes for later use.
+// Also used for peer_endorse messages (trust propagation).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PeerAnnounce {
     #[serde(rename = "type")]
@@ -31,7 +34,26 @@ struct PeerAnnounce {
     node_id: String,
     version: String,
     timestamp: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sender: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    node_list: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signature: Option<String>,
 }
+
+// Canonical form for peer_endorse signing (alphabetical by serialized key name)
+#[derive(Serialize)]
+struct CanonicalPeerEndorse<'a> {
+    node_id: &'a str,
+    node_list: &'a Vec<String>,
+    sender: &'a str,
+    timestamp: u64,
+    #[serde(rename = "type")]
+    msg_type: &'a str,
+    version: &'a str,
+}
+
 impl PeerAnnounce {
     fn new(node_id: &str, version: &str) -> Self {
         let timestamp = SystemTime::now()
@@ -43,6 +65,74 @@ impl PeerAnnounce {
             node_id: node_id.to_string(),
             version: version.to_string(),
             timestamp,
+            sender: None,
+            node_list: None,
+            signature: None,
+        }
+    }
+
+    fn new_endorse(node_id: &str, version: &str, sender: &str, endorsed_keys: Vec<String>) -> Self {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        Self {
+            msg_type: "peer_endorse".to_string(),
+            node_id: node_id.to_string(),
+            version: version.to_string(),
+            timestamp,
+            sender: Some(sender.to_string()),
+            node_list: Some(endorsed_keys),
+            signature: None,
+        }
+    }
+
+    fn canonical_endorse_bytes(&self) -> Vec<u8> {
+        let canonical = CanonicalPeerEndorse {
+            node_id: &self.node_id,
+            node_list: self.node_list.as_ref().expect("node_list required for endorse"),
+            sender: self.sender.as_ref().expect("sender required for endorse"),
+            timestamp: self.timestamp,
+            msg_type: &self.msg_type,
+            version: &self.version,
+        };
+        serde_json::to_vec(&canonical).expect("Canonical JSON serialization should not fail")
+    }
+
+    fn sign_endorse(&mut self, signing_key: &SigningKey) {
+        let canonical = self.canonical_endorse_bytes();
+        let sig = signing_key.sign(&canonical);
+        self.signature = Some(hex::encode(sig.to_bytes()));
+    }
+
+    fn verify_endorse_signature(&self) -> Result<bool, String> {
+        let sig_hex = match &self.signature {
+            Some(s) => s,
+            None => return Ok(false),
+        };
+        let sender_hex = match &self.sender {
+            Some(s) => s,
+            None => return Err("No sender field".to_string()),
+        };
+
+        let pubkey_bytes: [u8; 32] = hex::decode(sender_hex)
+            .map_err(|e| format!("Bad sender hex: {e}"))?
+            .try_into()
+            .map_err(|_| "Sender is not 32 bytes".to_string())?;
+
+        let sig_bytes: [u8; 64] = hex::decode(sig_hex)
+            .map_err(|e| format!("Bad signature hex: {e}"))?
+            .try_into()
+            .map_err(|_| "Signature is not 64 bytes".to_string())?;
+
+        let verifying_key =
+            VerifyingKey::from_bytes(&pubkey_bytes).map_err(|e| format!("Bad pubkey: {e}"))?;
+        let signature = Signature::from_bytes(&sig_bytes);
+
+        let canonical = self.canonical_endorse_bytes();
+        match verifying_key.verify(&canonical, &signature) {
+            Ok(()) => Ok(true),
+            Err(e) => Err(format!("Signature verification failed: {e}")),
         }
     }
 }
@@ -124,18 +214,25 @@ async fn main() -> anyhow::Result<()> {
         env::var("KNOWN_PEERS_FILE").unwrap_or_else(|_| DEFAULT_KNOWN_PEERS_FILE.to_string());
     let dht_initial_secret = env::var("DHT_INITIAL_SECRET")
         .unwrap_or_else(|_| DEFAULT_DHT_SECRET.to_string());
-    let trusted_peers_file =
+    let trusted_publishers_file =
         env::var("TRUSTED_PUBLISHERS_FILE").unwrap_or_else(|_| DEFAULT_TRUSTED_PUBLISHERS_FILE.to_string());
+    let peer_endorse_interval: u64 = env::var("PEER_ENDORSE_INTERVAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_PEER_ENDORSE_INTERVAL);
 
-    let trusted_publishers = load_trusted_publishers(&trusted_peers_file);
+    let trusted_publishers = Arc::new(RwLock::new(load_trusted_publishers(&trusted_publishers_file)));
 
     println!("  Topic: \"{}\"", TOPIC_STRING);
     println!("  DHT discovery: enabled");
-    println!("  Trusted publishers file: {}", trusted_peers_file);
-    if trusted_publishers.is_empty() {
-        println!("  Trusted publisher filter: disabled (accepting all)");
-    } else {
-        println!("  Trusted publisher filter: {} senders", trusted_publishers.len());
+    println!("  Trusted publishers file: {}", trusted_publishers_file);
+    {
+        let tp = trusted_publishers.read().unwrap();
+        if tp.is_empty() {
+            println!("  Trusted publisher filter: disabled (accepting all)");
+        } else {
+            println!("  Trusted publisher filter: {} senders", tp.len());
+        }
     }
 
     //Set up Iroh context
@@ -146,9 +243,14 @@ async fn main() -> anyhow::Result<()> {
         .bind()
         .await?;
 
+    // Create ed25519 signing key for peer_endorse messages (derived from node key)
+    let signing_key = SigningKey::from_bytes(&node_key_bytes);
+    let pubkey_hex = hex::encode(signing_key.verifying_key().to_bytes());
+
     //Self assign an Iroh node id
     let my_node_id = endpoint.id();
     println!("  Iroh Node ID: {}", my_node_id);
+    println!("  Sender pubkey: {}", pubkey_hex);
 
     //Launch Iroh modules
     let gossip = Gossip::builder()
@@ -205,6 +307,7 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(300);
     println!("  Announce interval: {}s", peer_announce_interval);
+    println!("  Endorse interval: {}s", peer_endorse_interval);
 
     if peer_announce_interval > 0 {
         let announce_sender = gossip_sender.clone();
@@ -227,6 +330,44 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // --- Periodic PeerEndorse broadcast task ---
+    if peer_endorse_interval > 0 {
+        let endorse_sender = gossip_sender.clone();
+        let endorse_node_id = my_node_id.to_string();
+        let endorse_pubkey = pubkey_hex.clone();
+        let endorse_signing_key = signing_key.clone();
+        let endorse_trusted = trusted_publishers.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(peer_endorse_interval)).await;
+                let keys: Vec<String> = {
+                    let tp = endorse_trusted.read().unwrap();
+                    if tp.is_empty() {
+                        continue;
+                    }
+                    tp.iter().cloned().collect()
+                };
+                let mut endorse = PeerAnnounce::new_endorse(
+                    &endorse_node_id,
+                    env!("CARGO_PKG_VERSION"),
+                    &endorse_pubkey,
+                    keys,
+                );
+                endorse.sign_endorse(&endorse_signing_key);
+                match serde_json::to_vec(&endorse) {
+                    Ok(payload) => {
+                        if let Err(e) = endorse_sender.broadcast(payload).await {
+                            eprintln!("[error] Failed to broadcast PeerEndorse: {}", e);
+                        } else {
+                            println!("[info] Broadcast PeerEndorse ({} keys)", endorse.node_list.as_ref().map_or(0, |l| l.len()));
+                        }
+                    }
+                    Err(e) => eprintln!("[error] Failed to serialize PeerEndorse: {}", e),
+                }
+            }
+        });
+    }
+
     println!(
         "\n  Listening for gossip notifications. This will take a minute. Patience grasshopper...\n"
     );
@@ -238,7 +379,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             item = gossip_receiver.next() => {
                 match item {
-                    Some(Ok(event)) => handle_event(event, &peers_file, &my_node_id, &trusted_publishers),
+                    Some(Ok(event)) => handle_event(event, &peers_file, &my_node_id, &trusted_publishers, &trusted_publishers_file),
                     Some(Err(e)) => eprintln!("[error] gossip stream error: {e}"),
                     None => {
                         println!("[info] gossip stream ended");
@@ -259,7 +400,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 //Incoming Iroh gossip event handler
-fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, trusted_peers: &HashSet<String>) {
+fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, trusted_publishers: &Arc<RwLock<HashSet<String>>>, trusted_publishers_file: &str) {
     match event {
         Event::Received(msg) => {
             let raw = &msg.content[..];
@@ -270,12 +411,61 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, t
                     if let Ok(node_id) = announce.node_id.parse() {
                         save_peer_if_new(peers_file, &node_id, my_node_id);
                     }
+                } else if announce.msg_type == "peer_endorse" {
+                    // Verify signature
+                    match announce.verify_endorse_signature() {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            eprintln!("\x1b[35m[WARN] PeerEndorse without signature, ignoring\x1b[0m");
+                            return;
+                        }
+                        Err(e) => {
+                            eprintln!("\x1b[35m[WARN] PeerEndorse bad signature: {e}\x1b[0m");
+                            return;
+                        }
+                    }
+
+                    let sender = match &announce.sender {
+                        Some(s) => s.clone(),
+                        None => return,
+                    };
+
+                    // Check if the endorser is trusted
+                    let is_trusted = {
+                        let tp = trusted_publishers.read().unwrap();
+                        tp.contains(&sender)
+                    };
+
+                    if !is_trusted {
+                        println!("\x1b[33m[ENDORSE] PeerEndorse from untrusted sender {}, ignoring\x1b[0m", &sender[..8.min(sender.len())]);
+                        return;
+                    }
+
+                    // Add endorsed keys
+                    if let Some(ref node_list) = announce.node_list {
+                        let mut added = 0;
+                        {
+                            let mut tp = trusted_publishers.write().unwrap();
+                            for key in node_list {
+                                if tp.insert(key.clone()) {
+                                    added += 1;
+                                    println!("\x1b[32m[ENDORSE] Added trusted publisher {} (endorsed by {})\x1b[0m", &key[..8.min(key.len())], &sender[..8.min(sender.len())]);
+                                }
+                            }
+                        }
+                        if added > 0 {
+                            let tp = trusted_publishers.read().unwrap();
+                            save_trusted_publishers(trusted_publishers_file, &tp);
+                            println!("\x1b[32m[ENDORSE] {} new keys added, {} total trusted publishers\x1b[0m", added, tp.len());
+                        }
+                    }
                 }
             } else {
                 // Fall back to GossipNotification
                 match serde_json::from_slice::<GossipNotification>(raw) {
                     Ok(notif) => {
-                        if trusted_peers.is_empty() || trusted_peers.contains(&notif.sender) {
+                        let tp = trusted_publishers.read().unwrap();
+                        if tp.is_empty() || tp.contains(&notif.sender) {
                             print_notification(&notif);
                         }
                     }
@@ -328,6 +518,20 @@ fn load_trusted_publishers(path: &str) -> HashSet<String> {
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect()
+}
+
+//Save trusted publishers to file (atomic overwrite)
+fn save_trusted_publishers(path: &str, peers: &HashSet<String>) {
+    if let Some(parent) = Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = fs::create_dir_all(parent);
+        }
+    }
+    if let Ok(mut f) = fs::File::create(path) {
+        for key in peers {
+            let _ = writeln!(f, "{}", key);
+        }
+    }
 }
 
 //Load known peers from a text file
