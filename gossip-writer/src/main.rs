@@ -287,7 +287,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         while let Some(payload) = rx.recv().await {
             if let Err(e) = broadcast_sender.broadcast(payload).await {
-                eprintln!("  Gossip broadcast error: {}", e);
+                eprintln!("\x1b[35m[WARN] Gossip broadcast error: {}\x1b[0m", e);
             }
         }
     });
@@ -302,12 +302,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match serde_json::to_vec(&announce) {
                     Ok(payload) => {
                         if let Err(e) = announce_tx.send(payload).await {
-                            eprintln!("  Failed to queue PeerAnnounce: {}", e);
+                            eprintln!("\x1b[35m[WARN] Failed to queue PeerAnnounce: {}\x1b[0m", e);
                         } else {
-                            println!("  Broadcast PeerAnnounce for {}", announce_node_id);
+                            println!("\x1b[33m[ANNOUNCE] Broadcast PeerAnnounce for {}\x1b[0m", announce_node_id);
                         }
                     }
-                    Err(e) => eprintln!("  Failed to serialize PeerAnnounce: {}", e),
+                    Err(e) => eprintln!("\x1b[35m[WARN] Failed to serialize PeerAnnounce: {}\x1b[0m", e),
                 }
             }
         });
@@ -340,12 +340,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match serde_json::to_vec(&endorse) {
                     Ok(payload) => {
                         if let Err(e) = endorse_tx.send(payload).await {
-                            eprintln!("  Failed to queue PeerEndorse: {}", e);
+                            eprintln!("\x1b[35m[WARN] Failed to queue PeerEndorse: {}\x1b[0m", e);
                         } else {
-                            println!("  Broadcast PeerEndorse ({} keys)", endorse.node_list.as_ref().map_or(0, |l| l.len()));
+                            println!("\x1b[32m[ENDORSE] Broadcast PeerEndorse ({} keys)\x1b[0m", endorse.node_list.as_ref().map_or(0, |l| l.len()));
                         }
                     }
-                    Err(e) => eprintln!("  Failed to serialize PeerEndorse: {}", e),
+                    Err(e) => eprintln!("\x1b[35m[WARN] Failed to serialize PeerEndorse: {}\x1b[0m", e),
                 }
             }
         });
@@ -364,7 +364,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Try PeerAnnounce first
                     if let Ok(announce) = serde_json::from_slice::<PeerAnnounce>(&msg.content) {
                         if announce.msg_type == "peer_announce" {
-                            println!("  GOSSIP RECV: PeerAnnounce from {} v{}", announce.node_id, announce.version);
+                            println!("\x1b[33m[ANNOUNCE] PeerAnnounce from {} v{}\x1b[0m", announce.node_id, announce.version);
                             if let Ok(node_id) = announce.node_id.parse() {
                                 save_peer_if_new(&recv_peers_file, &node_id, &recv_my_node_id);
                             }
@@ -376,11 +376,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             match announce.verify_endorse_signature() {
                                 Ok(true) => {}
                                 Ok(false) => {
-                                    eprintln!("  GOSSIP RECV: PeerEndorse without signature, ignoring");
+                                    eprintln!("\x1b[35m[WARN] PeerEndorse without signature, ignoring\x1b[0m");
                                     continue;
                                 }
                                 Err(e) => {
-                                    eprintln!("  GOSSIP RECV: PeerEndorse bad signature: {e}");
+                                    eprintln!("\x1b[35m[WARN] PeerEndorse bad signature: {e}\x1b[0m");
                                     continue;
                                 }
                             }
@@ -397,7 +397,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             };
 
                             if !is_trusted {
-                                println!("  GOSSIP RECV: PeerEndorse from untrusted sender {}, ignoring", &sender[..8.min(sender.len())]);
+                                println!("\x1b[33m[ENDORSE] PeerEndorse from untrusted sender {}, ignoring\x1b[0m", &sender[..8.min(sender.len())]);
                                 continue;
                             }
 
@@ -409,14 +409,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     for key in node_list {
                                         if tp.insert(key.clone()) {
                                             added += 1;
-                                            println!("  GOSSIP RECV: Added trusted publisher {} (endorsed by {})", &key[..8.min(key.len())], &sender[..8.min(sender.len())]);
+                                            println!("\x1b[32m[ENDORSE] Added trusted publisher {} (endorsed by {})\x1b[0m", &key[..8.min(key.len())], &sender[..8.min(sender.len())]);
                                         }
                                     }
                                 }
                                 if added > 0 {
                                     let tp = recv_trusted.read().unwrap();
                                     save_trusted_publishers(&recv_trusted_file, &tp);
-                                    println!("  GOSSIP RECV: {} new keys added, {} total trusted publishers", added, tp.len());
+                                    println!("\x1b[32m[ENDORSE] {} new keys added, {} total trusted publishers\x1b[0m", added, tp.len());
                                 }
                             }
                         }
@@ -425,34 +425,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         match serde_json::from_slice::<notification::GossipNotification>(&msg.content) {
                             Ok(notif) => {
                                 println!(
-                                    "  GOSSIP RECV: [{} IRIs] sender={} medium={} reason={}",
+                                    "\x1b[36m[GOSSIP] [{} IRIs] sender={} medium={} reason={}\x1b[0m",
                                     notif.iris.len(),
                                     &notif.sender[..8],
                                     notif.medium,
                                     notif.reason
                                 );
                                 for iri in notif.iris {
-                                    println!("    > {}", iri);
+                                    println!("\x1b[36m[GOSSIP]   > {}\x1b[0m", iri);
                                 }
                             }
                             Err(_) => {
-                                println!("  GOSSIP RECV: unknown format ({} bytes)", msg.content.len());
+                                eprintln!("\x1b[35m[WARN] unknown message format ({} bytes)\x1b[0m", msg.content.len());
                             }
                         }
                     }
                 }
                 Ok(Event::NeighborUp(node_id)) => {
-                    println!("  [event] NeighborUp: {node_id}");
+                    println!("\x1b[32m[EVENT] NeighborUp: {node_id}\x1b[0m");
                     save_peer_if_new(&recv_peers_file, &node_id, &recv_my_node_id);
                 }
                 Ok(Event::NeighborDown(node_id)) => {
-                    println!("  [event] NeighborDown: {node_id}");
+                    println!("\x1b[31m[EVENT] NeighborDown: {node_id}\x1b[0m");
                 }
                 Ok(Event::Lagged) => {
-                    eprintln!("  Gossip receiver lagged, some messages were missed.");
+                    eprintln!("\x1b[35m[WARN] lagged — missed some messages\x1b[0m");
                 }
                 Err(e) => {
-                    eprintln!("  Gossip receiver error: {}", e);
+                    eprintln!("\x1b[35m[WARN] Gossip receiver error: {}\x1b[0m", e);
                     break;
                 }
             }
@@ -496,7 +496,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ) {
                         Ok(_) => {}
                         Err(e) => {
-                            eprintln!("  Error processing ZMQ message: {}", e);
+                            eprintln!("\x1b[35m[WARN] Error processing ZMQ message: {}\x1b[0m", e);
                         }
                     }
                 }
@@ -505,7 +505,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
                 Err(e) => {
-                    eprintln!("  ZMQ recv error: {}", e);
+                    eprintln!("\x1b[35m[WARN] ZMQ recv error: {}\x1b[0m", e);
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
             }
@@ -544,7 +544,7 @@ fn process_message(
 
     // We only care about PodpingWrite messages
     if payload_type != "org.podcastindex.podping.hivewriter.PodpingWrite.capnp" {
-        eprintln!("  Ignoring non-PodpingWrite message: {}", payload_type);
+        eprintln!("\x1b[35m[WARN] Ignoring non-PodpingWrite message: {}\x1b[0m", payload_type);
         return Ok(());
     }
 
@@ -564,7 +564,7 @@ fn process_message(
     let medium_str = notification::medium_to_string(medium_enum as u16);
 
     println!(
-        "  Received: [{}] reason={} medium={}",
+        "\x1b[36m[ZMQ] Received: [{}] reason={} medium={}\x1b[0m",
         iri, reason_str, medium_str
     );
 
@@ -583,15 +583,15 @@ fn process_message(
         notif.timestamp,
         notif.iris.len(),
     ) {
-        Ok(true) => println!("    Archived (new)."),
-        Ok(false) => println!("    Archived (duplicate, skipped)."),
-        Err(e) => eprintln!("    Archive error: {}", e),
+        Ok(true) => println!("\x1b[36m[ZMQ]   Archived (new).\x1b[0m"),
+        Ok(false) => println!("\x1b[36m[ZMQ]   Archived (duplicate, skipped).\x1b[0m"),
+        Err(e) => eprintln!("\x1b[35m[WARN]  Archive error: {}\x1b[0m", e),
     }
 
     // Send to the async broadcast task via mpsc channel
     match tx.blocking_send(signed_payload) {
         Ok(_) => {
-            println!("    Queued for gossip broadcast.");
+            println!("\x1b[32m[ZMQ]   Queued for gossip broadcast.\x1b[0m");
 
             // Build a PodpingHiveTransaction reply so podping can remove the IRI from the queue
             let timestamp_secs = SystemTime::now()
@@ -637,11 +637,11 @@ fn process_message(
             let mut reply_buf = Vec::new();
             capnp::serialize::write_message(&mut reply_buf, &plexo_builder)?;
             match socket.send(&reply_buf, zmq::DONTWAIT) {
-                Ok(_) => println!("    Sent PodpingHiveTransaction reply (gossip)."),
-                Err(e) => eprintln!("    Failed to send reply: {}", e),
+                Ok(_) => println!("\x1b[36m[ZMQ]   Sent PodpingHiveTransaction reply (gossip).\x1b[0m"),
+                Err(e) => eprintln!("\x1b[35m[WARN]  Failed to send reply: {}\x1b[0m", e),
             }
         }
-        Err(e) => eprintln!("    Failed to queue for broadcast: {}", e),
+        Err(e) => eprintln!("\x1b[35m[WARN]  Failed to queue for broadcast: {}\x1b[0m", e),
     }
 
     Ok(())
