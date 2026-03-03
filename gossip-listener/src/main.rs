@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::io::Write;
@@ -20,6 +21,7 @@ const MAX_KNOWN_PEERS: usize = 15;
 const DEFAULT_DHT_SECRET: &str = "podping_gossip_default_secret";
 const DEFAULT_TRUSTED_PUBLISHERS_FILE: &str = "trusted_publishers.txt";
 const DEFAULT_PEER_ENDORSE_INTERVAL: u64 = 45;
+const REBOOTSTRAP_TIMEOUT: u64 = 180;
 
 //Structs ------------------------------------------------------------------------------------------
 
@@ -368,6 +370,48 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // --- Re-bootstrap watchdog: if no GossipNotification in 3 minutes, re-join peers ---
+    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let last_notification_time = Arc::new(AtomicU64::new(now_secs));
+
+    {
+        let watchdog_last = last_notification_time.clone();
+        let watchdog_sender = gossip_sender.clone();
+        let watchdog_peers_file = peers_file.clone();
+        let watchdog_bootstrap_str = bootstrap_peer_ids_str.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(REBOOTSTRAP_TIMEOUT)).await;
+                let last = watchdog_last.load(Ordering::Relaxed);
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                if now - last >= REBOOTSTRAP_TIMEOUT {
+                    println!("\x1b[33m[WATCHDOG] No gossip notifications for {}s, re-bootstrapping...\x1b[0m", now - last);
+
+                    let mut peers: Vec<iroh::EndpointId> = watchdog_bootstrap_str
+                        .split(',')
+                        .filter(|s| !s.trim().is_empty())
+                        .filter_map(|s| s.trim().parse().ok())
+                        .collect();
+                    let file_peers = load_known_peers(&watchdog_peers_file);
+                    for p in file_peers {
+                        if !peers.contains(&p) {
+                            peers.push(p);
+                        }
+                    }
+
+                    if peers.is_empty() {
+                        println!("\x1b[33m[WATCHDOG] No known peers to re-bootstrap with\x1b[0m");
+                    } else {
+                        println!("\x1b[33m[WATCHDOG] Re-joining {} peers...\x1b[0m", peers.len());
+                        if let Err(e) = watchdog_sender.join_peers(peers, None).await {
+                            eprintln!("\x1b[35m[WARN] Re-bootstrap failed: {}\x1b[0m", e);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     println!(
         "\n  Listening for gossip notifications. This will take a minute. Patience grasshopper...\n"
     );
@@ -379,7 +423,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             item = gossip_receiver.next() => {
                 match item {
-                    Some(Ok(event)) => handle_event(event, &peers_file, &my_node_id, &trusted_publishers, &trusted_publishers_file),
+                    Some(Ok(event)) => handle_event(event, &peers_file, &my_node_id, &trusted_publishers, &trusted_publishers_file, &last_notification_time),
                     Some(Err(e)) => eprintln!("[error] gossip stream error: {e}"),
                     None => {
                         println!("[info] gossip stream ended");
@@ -400,7 +444,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 //Incoming Iroh gossip event handler
-fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, trusted_publishers: &Arc<RwLock<HashSet<String>>>, trusted_publishers_file: &str) {
+fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, trusted_publishers: &Arc<RwLock<HashSet<String>>>, trusted_publishers_file: &str, last_notification_time: &Arc<AtomicU64>) {
     match event {
         Event::Received(msg) => {
             let raw = &msg.content[..];
@@ -464,6 +508,8 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, t
                 // Fall back to GossipNotification
                 match serde_json::from_slice::<GossipNotification>(raw) {
                     Ok(notif) => {
+                        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                        last_notification_time.store(now, Ordering::Relaxed);
                         let tp = trusted_publishers.read().unwrap();
                         if tp.is_empty() || tp.contains(&notif.sender) {
                             print_notification(&notif);
