@@ -183,6 +183,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let auto_trust_endorsements = env::var("AUTO_TRUST_ENDORSEMENTS")
         .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false);
+    let archive_enabled = env::var("ARCHIVE_ENABLED")
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
 
     let trusted_publishers = Arc::new(RwLock::new(load_trusted_publishers(&trusted_publishers_file)));
 
@@ -190,7 +193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  ZMQ bind:     {}", zmq_bind);
     println!("  Key file:     {}", key_file);
     println!("  Node key:     {}", node_key_file);
-    println!("  Archive:      {}", archive_path);
+    println!("  Archive:      {}", if archive_enabled { &archive_path } else { "disabled" });
     println!("  Peers file:   {}", peers_file);
     println!("  Topic:        {}", TOPIC_STRING);
     println!("  Announce interval: {}s", peer_announce_interval);
@@ -212,9 +215,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pubkey_hex = notification::pubkey_hex(&signing_key);
     println!("  Sender pubkey: {}", pubkey_hex);
 
-    // --- Open SQLite archive ---
-    let db = archive::Archive::open(&archive_path)?;
-    println!("  Archive DB ready.");
+    // --- Optionally open SQLite archive ---
+    let db = if archive_enabled {
+        let archive = archive::Archive::open(&archive_path)?;
+        println!("  Archive DB ready.");
+        Some(archive)
+    } else {
+        None
+    };
 
     // --- Set up Iroh endpoint and gossip ---
     // Load or create a persistent iroh node key (separate from the ed25519-dalek signing key)
@@ -536,7 +544,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &msg,
                         &signing_key_clone,
                         &pubkey_hex_clone,
-                        &db,
+                        db.as_ref(),
                         &tx,
                         &pull_socket,
                     ) {
@@ -578,7 +586,7 @@ fn process_message(
     msg: &zmq::Message,
     signing_key: &ed25519_dalek::SigningKey,
     pubkey_hex: &str,
-    db: &archive::Archive,
+    db: Option<&archive::Archive>,
     tx: &mpsc::Sender<Vec<u8>>,
     socket: &zmq::Socket,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -621,17 +629,19 @@ fn process_message(
     let signed_payload = notif.sign(signing_key);
 
     // Archive to SQLite (INSERT OR IGNORE by content hash)
-    match db.store(
-        &signed_payload,
-        pubkey_hex,
-        medium_str,
-        reason_str,
-        notif.timestamp,
-        notif.iris.len(),
-    ) {
-        Ok(true) => println!("\x1b[36m[ZMQ]   Archived (new).\x1b[0m"),
-        Ok(false) => println!("\x1b[36m[ZMQ]   Archived (duplicate, skipped).\x1b[0m"),
-        Err(e) => eprintln!("\x1b[35m[WARN]  Archive error: {}\x1b[0m", e),
+    if let Some(db) = db {
+        match db.store(
+            &signed_payload,
+            pubkey_hex,
+            medium_str,
+            reason_str,
+            notif.timestamp,
+            notif.iris.len(),
+        ) {
+            Ok(true) => println!("\x1b[36m[ZMQ]   Archived (new).\x1b[0m"),
+            Ok(false) => println!("\x1b[36m[ZMQ]   Archived (duplicate, skipped).\x1b[0m"),
+            Err(e) => eprintln!("\x1b[35m[WARN]  Archive error: {}\x1b[0m", e),
+        }
     }
 
     // Send to the async broadcast task via mpsc channel
