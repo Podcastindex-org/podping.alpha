@@ -17,3 +17,5 @@ hex = "0.4"
 bytes = "1"
 anyhow = "1"
 rand = "0.9"
+rusqlite = { version = "0.28", features = ["bundled"] }
+blake3 = "1"

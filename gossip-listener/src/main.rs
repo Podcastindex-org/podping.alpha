@@ -1,3 +1,5 @@
+mod archive;
+
 use std::collections::HashSet;
 use std::env;
 use std::fs;
@@ -20,6 +22,7 @@ const DEFAULT_KNOWN_PEERS_FILE: &str = "gossip_listener_known_peers.txt";
 const MAX_KNOWN_PEERS: usize = 15;
 const DEFAULT_DHT_SECRET: &str = "podping_gossip_default_secret";
 const DEFAULT_TRUSTED_PUBLISHERS_FILE: &str = "trusted_publishers.txt";
+const DEFAULT_ARCHIVE_PATH: &str = "listener_archive.db";
 const DEFAULT_PEER_ENDORSE_INTERVAL: u64 = 45;
 const REBOOTSTRAP_TIMEOUT: u64 = 180;
 
@@ -222,11 +225,33 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_PEER_ENDORSE_INTERVAL);
+    let archive_enabled = env::var("ARCHIVE_ENABLED")
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    let archive_path =
+        env::var("ARCHIVE_PATH").unwrap_or_else(|_| DEFAULT_ARCHIVE_PATH.to_string());
 
     let trusted_publishers = Arc::new(RwLock::new(load_trusted_publishers(&trusted_publishers_file)));
 
+    // Optionally open SQLite archive
+    let db = if archive_enabled {
+        match archive::Archive::open(&archive_path) {
+            Ok(a) => {
+                println!("  Archive DB ready: {}", archive_path);
+                Some(a)
+            }
+            Err(e) => {
+                eprintln!("\x1b[35m[WARN] Failed to open archive DB: {}\x1b[0m", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     println!("  Topic: \"{}\"", TOPIC_STRING);
     println!("  DHT discovery: enabled");
+    println!("  Archive:      {}", if archive_enabled { &archive_path } else { "disabled" });
     println!("  Trusted publishers file: {}", trusted_publishers_file);
     {
         let tp = trusted_publishers.read().unwrap();
@@ -423,7 +448,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             item = gossip_receiver.next() => {
                 match item {
-                    Some(Ok(event)) => handle_event(event, &peers_file, &my_node_id, &trusted_publishers, &trusted_publishers_file, &last_notification_time),
+                    Some(Ok(event)) => handle_event(event, &peers_file, &my_node_id, &trusted_publishers, &trusted_publishers_file, &last_notification_time, &db),
                     Some(Err(e)) => eprintln!("[error] gossip stream error: {e}"),
                     None => {
                         println!("[info] gossip stream ended");
@@ -444,7 +469,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 //Incoming Iroh gossip event handler
-fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, trusted_publishers: &Arc<RwLock<HashSet<String>>>, trusted_publishers_file: &str, last_notification_time: &Arc<AtomicU64>) {
+fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, trusted_publishers: &Arc<RwLock<HashSet<String>>>, trusted_publishers_file: &str, last_notification_time: &Arc<AtomicU64>, db: &Option<archive::Archive>) {
     match event {
         Event::Received(msg) => {
             let raw = &msg.content[..];
@@ -513,6 +538,20 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, t
                         let tp = trusted_publishers.read().unwrap();
                         if tp.is_empty() || tp.contains(&notif.sender) {
                             print_notification(&notif);
+                            if let Some(db) = db {
+                                match db.store(
+                                    raw,
+                                    &notif.sender,
+                                    &notif.medium,
+                                    &notif.reason,
+                                    notif.timestamp,
+                                    notif.iris.len(),
+                                ) {
+                                    Ok(true) => println!("\x1b[36m[ARCHIVE] Stored (new)\x1b[0m"),
+                                    Ok(false) => {}
+                                    Err(e) => eprintln!("\x1b[35m[WARN] Archive error: {}\x1b[0m", e),
+                                }
+                            }
                         }
                     }
                     Err(e) => {
