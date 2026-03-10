@@ -477,6 +477,9 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, t
             if let Ok(announce) = serde_json::from_slice::<PeerAnnounce>(raw) {
                 if announce.msg_type == "peer_announce" {
                     println!("\x1b[33m[ANNOUNCE] PeerAnnounce from {} v{}\x1b[0m", announce.node_id, announce.version);
+                    if version_is_newer(&announce.version, env!("CARGO_PKG_VERSION")) {
+                        println!("\x1b[1;41;37m *** A newer version (v{}) is available! You are running v{}. Please upgrade. *** \x1b[0m", announce.version, env!("CARGO_PKG_VERSION"));
+                    }
                     if let Ok(node_id) = announce.node_id.parse() {
                         save_peer_if_new(peers_file, &node_id, my_node_id);
                     }
@@ -589,6 +592,23 @@ fn print_notification(notif: &GossipNotification) {
         obj.insert("sig_status".to_string(), serde_json::Value::String(sig_status.to_string()));
     }
     println!("PODPING: [{}]", serde_json::to_string(&json).unwrap_or_default());
+}
+
+// Compare two semver-style version strings (e.g. "0.1.4").
+// Returns true if `remote` is strictly newer than `local`.
+fn version_is_newer(remote: &str, local: &str) -> bool {
+    let parse = |s: &str| -> Vec<u64> {
+        s.split('.').filter_map(|p| p.parse().ok()).collect()
+    };
+    let r = parse(remote);
+    let l = parse(local);
+    for i in 0..r.len().max(l.len()) {
+        let rv = r.get(i).copied().unwrap_or(0);
+        let lv = l.get(i).copied().unwrap_or(0);
+        if rv > lv { return true; }
+        if rv < lv { return false; }
+    }
+    false
 }
 
 //Load trusted sender public keys from the trusted sender file
