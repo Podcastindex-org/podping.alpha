@@ -8,10 +8,27 @@ on:
 permissions:
   contents: write
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create GitHub Release (if missing)
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists."
+          else
+            gh release create "$GITHUB_REF_NAME" --generate-notes
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   build-release:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
@@ -71,9 +88,9 @@ jobs:
         shell: pwsh
 
       - name: Upload release asset
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/${{ matrix.artifact_name }}
+        run: gh release upload "$GITHUB_REF_NAME" "dist/${{ matrix.artifact_name }}" --clobber
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Generate checksums
         if: ${{ matrix.os != 'windows-latest' }}
@@ -90,6 +107,6 @@ jobs:
         shell: pwsh
 
       - name: Upload checksum asset
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/${{ matrix.artifact_name }}.sha256
+        run: gh release upload "$GITHUB_REF_NAME" "dist/${{ matrix.artifact_name }}.sha256" --clobber
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
