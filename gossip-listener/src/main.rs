@@ -418,6 +418,35 @@ async fn run_catchup(
 //Main ---------------------------------------------------------------------------------------------
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // WORKAROUND: iroh-quinn 0.16.1 panic resilience
+    // iroh-quinn has a bug where a connection panic triggers a double-panic abort
+    // (first panic poisons a mutex, destructor panics acquiring it, Rust aborts).
+    // This hook logs the iroh-quinn context clearly before the inevitable abort so
+    // operators can distinguish it from application bugs. Docker restart: unless-stopped
+    // handles the actual recovery. Remove this when iroh-quinn is updated past 0.16.1.
+    std::panic::set_hook(Box::new(|info| {
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown".to_string()
+        };
+        let location = info.location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        let is_iroh = location.contains("iroh-quinn") || payload.contains("drained connections");
+        if is_iroh {
+            eprintln!("\x1b[1;31m[PANIC] Known iroh-quinn 0.16.1 bug at {}: {}\x1b[0m", location, payload);
+            eprintln!("\x1b[1;31m[PANIC] This is an upstream bug, not a gossip-listener issue. Process will restart via Docker.\x1b[0m");
+        } else {
+            eprintln!("\x1b[1;31m[PANIC] at {}: {}\x1b[0m", location, payload);
+            let bt = std::backtrace::Backtrace::force_capture();
+            eprintln!("{}", bt);
+        }
+    }));
+    // END WORKAROUND
+
     println!("gossip-listener v{}\n", env!("CARGO_PKG_VERSION"));
 
     // Configure from the environment
