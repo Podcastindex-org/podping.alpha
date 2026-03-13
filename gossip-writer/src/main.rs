@@ -483,7 +483,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Try PeerAnnounce first
                     if let Ok(announce) = serde_json::from_slice::<PeerAnnounce>(&msg.content) {
                         if announce.msg_type == "peer_announce" {
-                            println!("\x1b[33m[ANNOUNCE] PeerAnnounce from {} v{}\x1b[0m", announce.node_id, announce.version);
+                            if let Some(ref name) = announce.friendly_name {
+                                println!("\x1b[33m[ANNOUNCE] PeerAnnounce from \"{}\" ({}) v{}\x1b[0m", name, announce.node_id, announce.version);
+                            } else {
+                                println!("\x1b[33m[ANNOUNCE] PeerAnnounce from {} v{}\x1b[0m", announce.node_id, announce.version);
+                            }
                             if let Ok(node_id) = announce.node_id.parse() {
                                 save_peer_if_new(&recv_peers_file, &node_id, &recv_my_node_id);
                             }
@@ -515,8 +519,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 tp.contains(&sender)
                             };
 
+                            let sender_display = match &announce.friendly_name {
+                                Some(name) => format!("\"{}\" ({})", name, &sender[..8.min(sender.len())]),
+                                None => sender[..8.min(sender.len())].to_string(),
+                            };
+
                             if !is_trusted {
-                                println!("\x1b[33m[ENDORSE] PeerEndorse from untrusted sender {}, ignoring\x1b[0m", &sender[..8.min(sender.len())]);
+                                println!("\x1b[33m[ENDORSE] PeerEndorse from untrusted sender {}, ignoring\x1b[0m", sender_display);
                                 continue;
                             }
 
@@ -528,7 +537,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     for key in node_list {
                                         if tp.insert(key.clone()) {
                                             added += 1;
-                                            println!("\x1b[32m[ENDORSE] Added trusted publisher {} (endorsed by {})\x1b[0m", &key[..8.min(key.len())], &sender[..8.min(sender.len())]);
+                                            println!("\x1b[32m[ENDORSE] Added trusted publisher {} (endorsed by {})\x1b[0m", &key[..8.min(key.len())], sender_display);
                                         }
                                     }
                                 }
