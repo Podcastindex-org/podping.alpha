@@ -1,11 +1,11 @@
 [package]
 name = "gossip-listener"
-version = "0.1.8"
+version = "0.1.9"
 authors = ["Dave Jones"]
 edition = "2021"
 
 [dependencies]
-iroh = "0.96"
+iroh = "0.96.1"
 iroh-gossip = { version = "0.96", features = ["net"] }
 distributed-topic-tracker = { git = "https://github.com/rustonbsd/distributed-topic-tracker.git" }
 sha2 = "0.10"
@@ -17,5 +17,5 @@ hex = "0.4"
 bytes = "1"
 anyhow = "1"
 rand = "0.9"
-rusqlite = { version = "0.28", features = ["bundled"] }
+rusqlite = { version = "0.38.0", features = ["bundled"] }
 blake3 = "1"
