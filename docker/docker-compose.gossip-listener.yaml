@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   gossip-listener:
     image: ghcr.io/suorcd/gossip-listener:latest

@@ -1,5 +1,3 @@
-version: "3.7"
-
 services:
   podping-cloud:
     image: podcastindexorg/podcasting20-podping.alpha/frontend:3.0.0
