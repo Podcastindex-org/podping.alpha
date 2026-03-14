@@ -15,7 +15,8 @@ RUN cp target/release/gossip-writer .
 
 
 ##: Bundle stage
-FROM debian:bookworm-slim AS runner
+# Runner: use debian:trixie-slim to match the glibc from rust:latest
+FROM debian:trixie-slim AS runner
 
 USER root
 
@@ -30,4 +31,4 @@ RUN mkdir /opt/gossip-writer
 WORKDIR /opt/gossip-writer
 COPY --from=builder /opt/podping.alpha/gossip-writer/target/release/gossip-writer .
 
-ENTRYPOINT ["/opt/gossip-alpha/gossip-writer"]
+ENTRYPOINT ["/opt/gossip-writer/gossip-writer"]

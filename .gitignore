@@ -34,3 +34,4 @@ gossip_listener_node.key
 gossip_listener_known_peers.txt
 *log*/
 
+gossip-writer/data/*
