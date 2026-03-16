@@ -524,7 +524,7 @@ async fn main() -> anyhow::Result<()> {
     //Set up Iroh context
     let node_key = load_or_create_node_key(&node_key_file)?;
     let node_key_bytes = node_key.to_bytes();
-    let endpoint = iroh::Endpoint::builder()
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(node_key)
         .bind()
         .await?;
