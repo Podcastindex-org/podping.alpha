@@ -45,8 +45,11 @@
                 || pkgs.lib.hasPrefix "dtt-fork/" rel
                 || rel == "gossip-listener"
                 || rel == "dtt-fork";
+              # dtt-fork uses include_str!("../README.md") so .md files
+              # must survive filtering alongside normal Cargo sources.
+              isMarkdown = pkgs.lib.hasSuffix ".md" path;
             in
-            inScope && (craneLib.filterCargoSources path type);
+            inScope && ((craneLib.filterCargoSources path type) || isMarkdown);
         };
 
         # Vendor all dependencies (including the iroh-gossip git dep)
