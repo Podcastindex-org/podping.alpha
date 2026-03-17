@@ -8,6 +8,9 @@ RUN apt-get update \
 
 WORKDIR /src
 
+# Copy dtt-fork first (local path dependency of gossip-listener)
+COPY dtt-fork ./dtt-fork
+
 COPY gossip-listener/Cargo.toml gossip-listener/Cargo.lock ./gossip-listener/
 RUN mkdir -p /src/gossip-listener/src
 
