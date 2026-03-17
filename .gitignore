@@ -32,6 +32,7 @@ hive-watcher/proposal-watcher.py
 /podping/working_files/
 gossip_listener_node.key
 gossip_listener_known_peers.txt
+listener_archive.db
 *log*/
 
 gossip-writer/data/*
