@@ -105,6 +105,16 @@
           commonArgs
           // {
             inherit cargoArtifacts;
+
+            # Crane's default install hook runs cargo from the source root
+            # to discover binaries, but there is no Cargo.toml at the root.
+            # Install the binary directly from the build target directory.
+            installPhaseCommand = ''
+              mkdir -p $out/bin
+              install -m755 \
+                target/release/gossip-listener \
+                $out/bin/gossip-listener
+            '';
           }
         );
       in
