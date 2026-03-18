@@ -14,7 +14,8 @@ use iroh::SecretKey;
 use iroh_gossip::api::Event;
 use iroh_gossip::net::Gossip;
 use serde::{Deserialize, Serialize};
-use distributed_topic_tracker::{AutoDiscoveryGossip, RecordPublisher, TopicId as DttTopicId};
+use distributed_topic_tracker::{AutoDiscoveryGossip, RecordPublisher, TopicId as DttTopicId,
+    GossipSender as DttGossipSender, GossipReceiver as DttGossipReceiver};
 
 const TOPIC_STRING: &str = "gossipping/v1/all";
 const DEFAULT_NODE_KEY_FILE: &str = "gossip_listener_node.key";
@@ -25,6 +26,7 @@ const DEFAULT_TRUSTED_PUBLISHERS_FILE: &str = "trusted_publishers.txt";
 const DEFAULT_ARCHIVE_PATH: &str = "listener_archive.db";
 const DEFAULT_PEER_ENDORSE_INTERVAL: u64 = 45;
 const REBOOTSTRAP_TIMEOUT: u64 = 180;
+const RECONNECT_AFTER_FAILURES: u64 = 5;
 const ARCHIVE_SYNC_ALPN: &[u8] = b"/podping-archive-sync/1";
 
 //Structs ------------------------------------------------------------------------------------------
@@ -436,9 +438,12 @@ async fn main() -> anyhow::Result<()> {
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_else(|| "unknown location".to_string());
         let is_iroh = location.contains("iroh-quinn") || payload.contains("drained connections");
+        let is_actor_shutdown = payload.contains("actor stopped");
         if is_iroh {
             eprintln!("\x1b[1;31m[PANIC] Known iroh-quinn 0.16.1 bug at {}: {}\x1b[0m", location, payload);
             eprintln!("\x1b[1;31m[PANIC] This is an upstream bug, not a gossip-listener issue. Process will restart via Docker.\x1b[0m");
+        } else if is_actor_shutdown {
+            eprintln!("\x1b[33m[SHUTDOWN] DTT actor stopped (normal during shutdown)\x1b[0m");
         } else {
             eprintln!("\x1b[1;31m[PANIC] at {}: {}\x1b[0m", location, payload);
             let bt = std::backtrace::Backtrace::force_capture();
@@ -563,7 +568,7 @@ async fn main() -> anyhow::Result<()> {
         dht_signing_key.verifying_key(),
         dht_signing_key,
         None,
-        dht_initial_secret.into_bytes(),
+        dht_initial_secret.clone().into_bytes(),
     );
 
     let topic = gossip
@@ -571,6 +576,11 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     let (gossip_sender, gossip_receiver) = topic.split().await?;
     println!("  Joined gossip topic with DHT auto-discovery.");
+
+    // Shared sender so all tasks use the same sender (and reconnect can replace it)
+    let shared_sender: Arc<tokio::sync::RwLock<DttGossipSender>> =
+        Arc::new(tokio::sync::RwLock::new(gossip_sender));
+    let broadcast_failures = Arc::new(AtomicU64::new(0));
 
     //Joining peers from the known peers file serves as fallback/insurance if DHT no work
     let mut bootstrap_peers: Vec<iroh::EndpointId> = bootstrap_peer_ids_str
@@ -590,10 +600,15 @@ async fn main() -> anyhow::Result<()> {
         println!("  No additional bootstrap peers configured.");
     } else {
         println!("  Joining {} bootstrap peers...", bootstrap_peers.len());
-        if let Err(e) = gossip_sender.join_peers(bootstrap_peers, None).await {
+        let sender = shared_sender.read().await;
+        if let Err(e) = sender.join_peers(bootstrap_peers, None).await {
             eprintln!("  Warning: failed to join bootstrap peers: {}", e);
         }
     }
+
+    // --- Re-bootstrap watchdog timer ---
+    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let last_notification_time = Arc::new(AtomicU64::new(now_secs));
 
     //Periodically announce ourselves to the topic for the bootstrapping benefit of others
     let peer_announce_interval: u64 = env::var("PEER_ANNOUNCE_INTERVAL")
@@ -604,7 +619,8 @@ async fn main() -> anyhow::Result<()> {
     println!("  Endorse interval: {}s", peer_endorse_interval);
 
     if peer_announce_interval > 0 {
-        let announce_sender = gossip_sender.clone();
+        let announce_shared = shared_sender.clone();
+        let announce_failures = broadcast_failures.clone();
         let announce_node_id = my_node_id.to_string();
         let announce_friendly = friendly_name.clone();
         tokio::spawn(async move {
@@ -613,10 +629,18 @@ async fn main() -> anyhow::Result<()> {
                 let announce = PeerAnnounce::new(&announce_node_id, env!("CARGO_PKG_VERSION"), announce_friendly.clone());
                 match serde_json::to_vec(&announce) {
                     Ok(payload) => {
-                        if let Err(e) = announce_sender.broadcast(payload).await {
-                            eprintln!("[error] Failed to broadcast PeerAnnounce: {}", e);
-                        } else {
-                            println!("[info] Broadcast PeerAnnounce for {}", announce_node_id);
+                        let sender = announce_shared.read().await;
+                        match sender.broadcast(payload).await {
+                            Ok(_) => {
+                                announce_failures.store(0, Ordering::Relaxed);
+                                println!("[info] Broadcast PeerAnnounce for {}", announce_node_id);
+                            }
+                            Err(e) => {
+                                let count = announce_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                                if count <= 3 {
+                                    eprintln!("\x1b[35m[WARN] Failed to broadcast PeerAnnounce: {}\x1b[0m", e);
+                                }
+                            }
                         }
                     }
                     Err(e) => eprintln!("[error] Failed to serialize PeerAnnounce: {}", e),
@@ -627,7 +651,8 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Periodic PeerEndorse broadcast task ---
     if peer_endorse_interval > 0 {
-        let endorse_sender = gossip_sender.clone();
+        let endorse_shared = shared_sender.clone();
+        let endorse_failures = broadcast_failures.clone();
         let endorse_node_id = my_node_id.to_string();
         let endorse_pubkey = pubkey_hex.clone();
         let endorse_signing_key = signing_key.clone();
@@ -653,10 +678,18 @@ async fn main() -> anyhow::Result<()> {
                 endorse.sign_endorse(&endorse_signing_key);
                 match serde_json::to_vec(&endorse) {
                     Ok(payload) => {
-                        if let Err(e) = endorse_sender.broadcast(payload).await {
-                            eprintln!("[error] Failed to broadcast PeerEndorse: {}", e);
-                        } else {
-                            println!("[info] Broadcast PeerEndorse ({} keys)", endorse.node_list.as_ref().map_or(0, |l| l.len()));
+                        let sender = endorse_shared.read().await;
+                        match sender.broadcast(payload).await {
+                            Ok(_) => {
+                                endorse_failures.store(0, Ordering::Relaxed);
+                                println!("[info] Broadcast PeerEndorse ({} keys)", endorse.node_list.as_ref().map_or(0, |l| l.len()));
+                            }
+                            Err(e) => {
+                                let count = endorse_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                                if count <= 3 {
+                                    eprintln!("\x1b[35m[WARN] Failed to broadcast PeerEndorse: {}\x1b[0m", e);
+                                }
+                            }
                         }
                     }
                     Err(e) => eprintln!("[error] Failed to serialize PeerEndorse: {}", e),
@@ -666,12 +699,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // --- Re-bootstrap watchdog: if no GossipNotification in 3 minutes, re-join peers ---
-    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    let last_notification_time = Arc::new(AtomicU64::new(now_secs));
-
     {
         let watchdog_last = last_notification_time.clone();
-        let watchdog_sender = gossip_sender.clone();
+        let watchdog_shared = shared_sender.clone();
         let watchdog_peers_file = peers_file.clone();
         let watchdog_bootstrap_str = bootstrap_peer_ids_str.clone();
         tokio::spawn(async move {
@@ -698,8 +728,81 @@ async fn main() -> anyhow::Result<()> {
                         println!("\x1b[33m[WATCHDOG] No known peers to re-bootstrap with\x1b[0m");
                     } else {
                         println!("\x1b[33m[WATCHDOG] Re-joining {} peers...\x1b[0m", peers.len());
-                        if let Err(e) = watchdog_sender.join_peers(peers, None).await {
+                        let sender = watchdog_shared.read().await;
+                        if let Err(e) = sender.join_peers(peers, None).await {
                             eprintln!("\x1b[35m[WARN] Re-bootstrap failed: {}\x1b[0m", e);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // --- Reconnection monitor: watches for consecutive broadcast failures ---
+    {
+        let reconnect_failures = broadcast_failures.clone();
+        let reconnect_shared = shared_sender.clone();
+        let reconnect_gossip = gossip.clone();
+        let reconnect_node_key_bytes = node_key_bytes;
+        let reconnect_dht_secret = dht_initial_secret.clone();
+        let reconnect_peers_file = peers_file.clone();
+        let reconnect_my_node_id = my_node_id;
+        let reconnect_trusted = trusted_publishers.clone();
+        let reconnect_trusted_file = trusted_publishers_file.clone();
+        let reconnect_last_notif = last_notification_time.clone();
+        let reconnect_peer_names = peer_names.clone();
+        let reconnect_db = db.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let failures = reconnect_failures.load(Ordering::Relaxed);
+                if failures >= RECONNECT_AFTER_FAILURES {
+                    eprintln!("\x1b[1;31m[RECONNECT] {} consecutive broadcast failures — reconnecting gossip topic...\x1b[0m", failures);
+
+                    let dht_key = ed25519_dalek::SigningKey::from_bytes(&reconnect_node_key_bytes);
+                    let dtt_topic = DttTopicId::new(TOPIC_STRING.to_string());
+                    let publisher = RecordPublisher::new(
+                        dtt_topic,
+                        dht_key.verifying_key(),
+                        dht_key,
+                        None,
+                        reconnect_dht_secret.clone().into_bytes(),
+                    );
+                    match reconnect_gossip
+                        .subscribe_and_join_with_auto_discovery_no_wait(publisher)
+                        .await
+                    {
+                        Ok(new_topic) => match new_topic.split().await {
+                            Ok((new_sender, new_receiver)) => {
+                                // Replace the shared sender
+                                {
+                                    let mut sender_guard = reconnect_shared.write().await;
+                                    *sender_guard = new_sender;
+                                }
+                                reconnect_failures.store(0, Ordering::Relaxed);
+
+                                // Spawn a fresh receive task
+                                spawn_receive_task(
+                                    new_receiver,
+                                    reconnect_peers_file.clone(),
+                                    reconnect_my_node_id,
+                                    reconnect_trusted.clone(),
+                                    reconnect_trusted_file.clone(),
+                                    reconnect_last_notif.clone(),
+                                    reconnect_db.clone(),
+                                    reconnect_peer_names.clone(),
+                                );
+
+                                println!("\x1b[32m[RECONNECT] Gossip topic reconnected successfully.\x1b[0m");
+                            }
+                            Err(e) => {
+                                eprintln!("\x1b[1;31m[RECONNECT] Failed to split topic: {}. Will retry.\x1b[0m", e);
+                                reconnect_failures.store(0, Ordering::Relaxed);
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("\x1b[1;31m[RECONNECT] Failed to re-subscribe: {}. Will retry.\x1b[0m", e);
+                            reconnect_failures.store(0, Ordering::Relaxed);
                         }
                     }
                 }
@@ -754,7 +857,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(Mutex::new(None))
     };
 
-    // Main receive loop.  CTRL+C to close
+    // Main receive loop — runs until CTRL+C or stream ends
     let recv_peer_names = peer_names.clone();
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -928,7 +1031,15 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, t
             }
         }
         Event::NeighborUp(node_id) => {
-            println!("\x1b[32m[EVENT] NeighborUp: {node_id}\x1b[0m");
+            let node_str = node_id.to_string();
+            let display = {
+                let names = peer_names.read().unwrap();
+                match names.get(&node_str) {
+                    Some(name) => format!("\"{}\" ({})", name, node_id),
+                    None => node_str,
+                }
+            };
+            println!("\x1b[32m[EVENT] NeighborUp: {display}\x1b[0m");
             save_peer_if_new(peers_file, &node_id, my_node_id);
             // Forward to catch-up task if waiting (std::sync::Mutex is fine here:
             // lock held briefly, no .await while held, called from sync function)
@@ -939,7 +1050,15 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, t
             }
         }
         Event::NeighborDown(node_id) => {
-            println!("\x1b[31m[EVENT] NeighborDown: {node_id}\x1b[0m");
+            let node_str = node_id.to_string();
+            let display = {
+                let names = peer_names.read().unwrap();
+                match names.get(&node_str) {
+                    Some(name) => format!("\"{}\" ({})", name, node_id),
+                    None => node_str,
+                }
+            };
+            println!("\x1b[31m[EVENT] NeighborDown: {display}\x1b[0m");
         }
         Event::Lagged => {
             eprintln!("\x1b[35m[WARN] lagged — missed some messages\x1b[0m");
@@ -1107,4 +1226,44 @@ fn load_or_create_node_key(path: &str) -> anyhow::Result<SecretKey> {
         println!("  Generated new iroh node key -> {}", path);
         Ok(key)
     }
+}
+
+/// Spawn an async task that processes incoming gossip events. Called on startup
+/// and again after reconnection.
+fn spawn_receive_task(
+    receiver: DttGossipReceiver,
+    peers_file: String,
+    my_node_id: iroh::EndpointId,
+    trusted_publishers: Arc<RwLock<HashSet<String>>>,
+    trusted_publishers_file: String,
+    last_notification_time: Arc<AtomicU64>,
+    db: Option<Arc<Mutex<archive::Archive>>>,
+    peer_names: Arc<RwLock<HashMap<String, String>>>,
+) {
+    // Neighbor forwarding is not available on reconnect (catch-up is a startup-only feature)
+    let neighbor_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<iroh::EndpointId>>>> =
+        Arc::new(Mutex::new(None));
+
+    tokio::spawn(async move {
+        while let Some(event) = receiver.next().await {
+            match event {
+                Ok(event) => handle_event(
+                    event,
+                    &peers_file,
+                    &my_node_id,
+                    &trusted_publishers,
+                    &trusted_publishers_file,
+                    &last_notification_time,
+                    &db,
+                    &neighbor_tx,
+                    &peer_names,
+                ),
+                Err(e) => {
+                    eprintln!("\x1b[35m[WARN] Gossip receiver error: {}\x1b[0m", e);
+                    break;
+                }
+            }
+        }
+        println!("\x1b[33m[RECV] Gossip receive task ended.\x1b[0m");
+    });
 }
