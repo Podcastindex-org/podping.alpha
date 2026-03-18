@@ -1,6 +1,6 @@
 [package]
 name = "gossip-listener"
-version = "0.1.9"
+version = "0.2.0"
 authors = ["Dave Jones"]
 edition = "2021"
 
