@@ -789,7 +789,9 @@ dependencies = [
 
 [[package]]
 name = "distributed-topic-tracker"
-version = "0.2.7"
+version = "0.2.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42d94886a7440a10a01bed64bfe045a3b67fc3bffca6c48745d7403ecf052bb2"
 dependencies = [
  "actor-helper",
  "anyhow",
@@ -1294,7 +1296,7 @@ dependencies = [
 
 [[package]]
 name = "gossip-writer"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "blake3",
  "bytes",
@@ -1918,7 +1920,8 @@ dependencies = [
 [[package]]
 name = "iroh-gossip"
 version = "0.97.0"
-source = "git+https://github.com/n0-computer/iroh-gossip.git#9a30bbb4a9dee83dce43d1a4412acf3d3b6b1acd"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4db5b64f3cb0a0c8b68b57888acd4cefcd2f0774f1a132d2a498cbb2a92fbc55"
 dependencies = [
  "blake3",
  "bytes",

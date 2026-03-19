@@ -1,6 +1,6 @@
 [package]
 name = "gossip-writer"
-version = "0.2.3"
+version = "0.2.4"
 authors = ["Dave Jones"]
 edition = "2021"
 build = "build.rs"
@@ -18,8 +18,8 @@ podping-schemas = { git = "https://github.com/Podcastindex-org/podping-schemas-r
 
 # Iroh gossip networking
 iroh = "0.97.0"
-iroh-gossip = { git = "https://github.com/n0-computer/iroh-gossip.git", features = ["net"] }
-distributed-topic-tracker = { path = "../dtt-fork" }
+iroh-gossip = { version = "0.97", features = ["net"] }
+distributed-topic-tracker = "0.2.8"
 
 # Crypto: signing and hashing
 ed25519-dalek = { version = "3.0.0-pre.1", features = ["rand_core"] }
