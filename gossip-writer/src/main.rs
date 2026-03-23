@@ -6,7 +6,7 @@ use iroh::SecretKey;
 use iroh_gossip::net::Gossip;
 use iroh_gossip::api::Event;
 use distributed_topic_tracker::{GossipSender as DttGossipSender, GossipReceiver as DttGossipReceiver};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -168,6 +168,8 @@ const DEFAULT_PEER_ENDORSE_INTERVAL: u64 = 600;
 const REBOOTSTRAP_TIMEOUT: u64 = 180;
 const BATCH_INTERVAL_SECS: u64 = 3;
 const RECONNECT_AFTER_FAILURES: u64 = 5;
+const BROADCAST_TIMEOUT_SECS: u64 = 10;
+const MAX_RETRY_QUEUE: usize = 500;
 
 // A pending IRI extracted from a ZMQ message, waiting to be batched
 struct PendingPing {
@@ -415,16 +417,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reconnect_peer_names = peer_names.clone();
     tokio::spawn(async move {
         let mut consecutive_failures: u64 = 0;
+        let mut retry_queue: VecDeque<Vec<u8>> = VecDeque::new();
+        let timeout_dur = std::time::Duration::from_secs(BROADCAST_TIMEOUT_SECS);
+
         while let Some(payload) = rx.recv().await {
             if broadcast_shutdown.load(Ordering::Relaxed) {
                 break;
             }
+
+            // Try the new payload
             let result = {
                 let sender = broadcast_shared.read().await;
-                sender.broadcast(payload.clone()).await
+                tokio::time::timeout(timeout_dur, sender.broadcast(payload.clone())).await
             };
             match result {
-                Ok(_) => {
+                Ok(Ok(_)) => {
                     bcast_sent.fetch_add(1, Ordering::Relaxed);
                     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                     bcast_last_ok.store(now, Ordering::Relaxed);
@@ -433,69 +440,100 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     consecutive_failures = 0;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     bcast_failed.fetch_add(1, Ordering::Relaxed);
                     consecutive_failures += 1;
+                    // Queue for retry
+                    if retry_queue.len() < MAX_RETRY_QUEUE {
+                        retry_queue.push_back(payload);
+                    }
                     if consecutive_failures <= 3 {
                         eprintln!("\x1b[35m[WARN] Gossip broadcast error: {}\x1b[0m", e);
-                    } else if consecutive_failures == RECONNECT_AFTER_FAILURES {
-                        eprintln!("\x1b[1;31m[RECONNECT] {} consecutive broadcast failures — reconnecting gossip topic...\x1b[0m", consecutive_failures);
-                        // Attempt to re-subscribe to the gossip topic
-                        let dht_key = ed25519_dalek::SigningKey::from_bytes(&reconnect_node_key_bytes);
-                        let dtt_topic = DttTopicId::new(TOPIC_STRING.to_string());
-                        let publisher = RecordPublisher::new(
-                            dtt_topic,
-                            dht_key.verifying_key(),
-                            dht_key,
-                            None,
-                            reconnect_dht_secret.clone().into_bytes(),
-                        );
-                        match reconnect_gossip
-                            .subscribe_and_join_with_auto_discovery_no_wait(publisher)
-                            .await
-                        {
-                            Ok(new_topic) => match new_topic.split().await {
-                                Ok((new_sender, new_receiver)) => {
-                                    // Replace the shared sender
-                                    {
-                                        let mut sender_guard = broadcast_shared.write().await;
-                                        *sender_guard = new_sender;
-                                    }
-
-                                    // Spawn a fresh receive task
-                                    spawn_receive_task(
-                                        new_receiver,
-                                        reconnect_peers_file.clone(),
-                                        reconnect_my_node_id,
-                                        reconnect_trusted.clone(),
-                                        reconnect_trusted_file.clone(),
-                                        reconnect_auto_trust,
-                                        reconnect_last_notif.clone(),
-                                        reconnect_peer_names.clone(),
-                                    );
-
-                                    // Retry the failed payload on the new sender
-                                    let sender = broadcast_shared.read().await;
-                                    if let Err(e2) = sender.broadcast(payload).await {
-                                        eprintln!("\x1b[35m[WARN] Broadcast still failing after reconnect: {}\x1b[0m", e2);
-                                    } else {
-                                        consecutive_failures = 0;
-                                        println!("\x1b[32m[RECONNECT] Gossip topic reconnected successfully.\x1b[0m");
-                                    }
-                                }
-                                Err(e2) => {
-                                    eprintln!("\x1b[1;31m[RECONNECT] Failed to split topic: {}. Will retry.\x1b[0m", e2);
-                                    consecutive_failures = 0;
-                                }
-                            },
-                            Err(e2) => {
-                                eprintln!("\x1b[1;31m[RECONNECT] Failed to re-subscribe: {}. Will retry on next batch.\x1b[0m", e2);
-                                // Reset counter so it tries again after another N failures
-                                consecutive_failures = 0;
-                            }
-                        }
                     }
-                    // Between 3 and RECONNECT_AFTER_FAILURES: suppress log spam
+                }
+                Err(_) => {
+                    // Timeout — broadcast hung
+                    bcast_failed.fetch_add(1, Ordering::Relaxed);
+                    consecutive_failures += 1;
+                    if retry_queue.len() < MAX_RETRY_QUEUE {
+                        retry_queue.push_back(payload);
+                    }
+                    if consecutive_failures <= 3 {
+                        eprintln!("\x1b[35m[WARN] Gossip broadcast timed out ({}s)\x1b[0m", BROADCAST_TIMEOUT_SECS);
+                    }
+                }
+            }
+
+            // Reconnect if enough consecutive failures
+            if consecutive_failures == RECONNECT_AFTER_FAILURES {
+                eprintln!("\x1b[1;31m[RECONNECT] {} consecutive broadcast failures — reconnecting gossip topic...\x1b[0m", consecutive_failures);
+                let dht_key = ed25519_dalek::SigningKey::from_bytes(&reconnect_node_key_bytes);
+                let dtt_topic = DttTopicId::new(TOPIC_STRING.to_string());
+                let publisher = RecordPublisher::new(
+                    dtt_topic,
+                    dht_key.verifying_key(),
+                    dht_key,
+                    None,
+                    reconnect_dht_secret.clone().into_bytes(),
+                );
+                match reconnect_gossip
+                    .subscribe_and_join_with_auto_discovery_no_wait(publisher)
+                    .await
+                {
+                    Ok(new_topic) => match new_topic.split().await {
+                        Ok((new_sender, new_receiver)) => {
+                            {
+                                let mut sender_guard = broadcast_shared.write().await;
+                                *sender_guard = new_sender;
+                            }
+
+                            spawn_receive_task(
+                                new_receiver,
+                                reconnect_peers_file.clone(),
+                                reconnect_my_node_id,
+                                reconnect_trusted.clone(),
+                                reconnect_trusted_file.clone(),
+                                reconnect_auto_trust,
+                                reconnect_last_notif.clone(),
+                                reconnect_peer_names.clone(),
+                            );
+
+                            // Drain retry queue through new sender
+                            let queued = retry_queue.len();
+                            if queued > 0 {
+                                println!("\x1b[32m[RECONNECT] Replaying {} queued broadcasts...\x1b[0m", queued);
+                                let sender = broadcast_shared.read().await;
+                                let mut replayed = 0;
+                                while let Some(queued_payload) = retry_queue.pop_front() {
+                                    match tokio::time::timeout(timeout_dur, sender.broadcast(queued_payload.clone())).await {
+                                        Ok(Ok(_)) => {
+                                            bcast_sent.fetch_add(1, Ordering::Relaxed);
+                                            replayed += 1;
+                                        }
+                                        _ => {
+                                            // New sender also failing — put it back and stop
+                                            retry_queue.push_front(queued_payload);
+                                            break;
+                                        }
+                                    }
+                                }
+                                println!("\x1b[32m[RECONNECT] Replayed {}/{} queued broadcasts\x1b[0m", replayed, queued);
+                            }
+
+                            consecutive_failures = 0;
+                            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                            bcast_last_ok.store(now, Ordering::Relaxed);
+                            println!("\x1b[32m[RECONNECT] Gossip topic reconnected successfully.\x1b[0m");
+                        }
+                        Err(e) => {
+                            eprintln!("\x1b[1;31m[RECONNECT] Failed to split topic: {}. Will retry.\x1b[0m", e);
+                            consecutive_failures = 0;
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("\x1b[1;31m[RECONNECT] Failed to re-subscribe: {}. Will retry on next batch.\x1b[0m", e);
+                        consecutive_failures = 0;
+                    }
                 }
             }
         }

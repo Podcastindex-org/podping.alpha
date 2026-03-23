@@ -28,6 +28,7 @@ const DEFAULT_ARCHIVE_PATH: &str = "listener_archive.db";
 const DEFAULT_PEER_ENDORSE_INTERVAL: u64 = 45;
 const REBOOTSTRAP_TIMEOUT: u64 = 180;
 const RECONNECT_AFTER_FAILURES: u64 = 5;
+const BROADCAST_TIMEOUT_SECS: u64 = 10;
 const ARCHIVE_SYNC_ALPN: &[u8] = b"/podping-archive-sync/1";
 const DEFAULT_SSE_BIND_ADDR: &str = "0.0.0.0:8089";
 const DEFAULT_SSE_BUFFER_SIZE: usize = 1000;
@@ -662,15 +663,24 @@ async fn main() -> anyhow::Result<()> {
                 match serde_json::to_vec(&announce) {
                     Ok(payload) => {
                         let sender = announce_shared.read().await;
-                        match sender.broadcast(payload).await {
-                            Ok(_) => {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(BROADCAST_TIMEOUT_SECS),
+                            sender.broadcast(payload),
+                        ).await {
+                            Ok(Ok(_)) => {
                                 announce_failures.store(0, Ordering::Relaxed);
                                 println!("[info] Broadcast PeerAnnounce for {}", announce_node_id);
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 let count = announce_failures.fetch_add(1, Ordering::Relaxed) + 1;
                                 if count <= 3 {
                                     eprintln!("\x1b[35m[WARN] Failed to broadcast PeerAnnounce: {}\x1b[0m", e);
+                                }
+                            }
+                            Err(_) => {
+                                let count = announce_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                                if count <= 3 {
+                                    eprintln!("\x1b[35m[WARN] PeerAnnounce broadcast timed out ({}s)\x1b[0m", BROADCAST_TIMEOUT_SECS);
                                 }
                             }
                         }
@@ -711,15 +721,24 @@ async fn main() -> anyhow::Result<()> {
                 match serde_json::to_vec(&endorse) {
                     Ok(payload) => {
                         let sender = endorse_shared.read().await;
-                        match sender.broadcast(payload).await {
-                            Ok(_) => {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(BROADCAST_TIMEOUT_SECS),
+                            sender.broadcast(payload),
+                        ).await {
+                            Ok(Ok(_)) => {
                                 endorse_failures.store(0, Ordering::Relaxed);
                                 println!("[info] Broadcast PeerEndorse ({} keys)", endorse.node_list.as_ref().map_or(0, |l| l.len()));
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 let count = endorse_failures.fetch_add(1, Ordering::Relaxed) + 1;
                                 if count <= 3 {
                                     eprintln!("\x1b[35m[WARN] Failed to broadcast PeerEndorse: {}\x1b[0m", e);
+                                }
+                            }
+                            Err(_) => {
+                                let count = endorse_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                                if count <= 3 {
+                                    eprintln!("\x1b[35m[WARN] PeerEndorse broadcast timed out ({}s)\x1b[0m", BROADCAST_TIMEOUT_SECS);
                                 }
                             }
                         }
