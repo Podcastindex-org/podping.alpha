@@ -420,7 +420,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bcast_failed = health_broadcasts_failed.clone();
     let bcast_last_ok = health_last_broadcast_ok.clone();
     let bcast_alive = health_broadcast_task_alive.clone();
-    let reconnect_gossip = gossip.clone();
+    let reconnect_endpoint = endpoint.clone();
     let reconnect_node_key_bytes = node_key_bytes;
     let reconnect_dht_secret = dht_initial_secret.clone();
     let reconnect_peers_file = peers_file.clone();
@@ -491,7 +491,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None,
                     reconnect_dht_secret.clone().into_bytes(),
                 );
-                match reconnect_gossip
+                // Spawn a fresh Gossip actor (the old one is dead after all topics quit)
+                let new_gossip = Gossip::builder()
+                    .max_message_size(65536)
+                    .spawn(reconnect_endpoint.clone());
+                // Re-register the new gossip with a fresh Router for incoming connections
+                let _new_router = Router::builder(reconnect_endpoint.clone())
+                    .accept(iroh_gossip::ALPN, new_gossip.clone())
+                    .spawn();
+                match new_gossip
                     .subscribe_and_join_with_auto_discovery_no_wait(publisher)
                     .await
                 {

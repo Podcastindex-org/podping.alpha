@@ -808,7 +808,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let reconnect_failures = broadcast_failures.clone();
         let reconnect_shared = shared_sender.clone();
-        let reconnect_gossip = gossip.clone();
+        let reconnect_endpoint = endpoint.clone();
         let reconnect_node_key_bytes = node_key_bytes;
         let reconnect_dht_secret = dht_initial_secret.clone();
         let reconnect_peers_file = peers_file.clone();
@@ -836,7 +836,19 @@ async fn main() -> anyhow::Result<()> {
                         None,
                         reconnect_dht_secret.clone().into_bytes(),
                     );
-                    match reconnect_gossip
+                    // Spawn a fresh Gossip actor (the old one is dead after all topics quit)
+                    let new_gossip = Gossip::builder()
+                        .max_message_size(65536)
+                        .spawn(reconnect_endpoint.clone());
+                    // Re-register the new gossip (and archive sync if active) with a fresh Router
+                    let mut new_router_builder = Router::builder(reconnect_endpoint.clone())
+                        .accept(iroh_gossip::ALPN, new_gossip.clone());
+                    if let Some(ref db_arc) = reconnect_db {
+                        let handler = ArchiveSyncHandler { db: db_arc.clone() };
+                        new_router_builder = new_router_builder.accept(ARCHIVE_SYNC_ALPN, handler);
+                    }
+                    let _new_router = new_router_builder.spawn();
+                    match new_gossip
                         .subscribe_and_join_with_auto_discovery_no_wait(publisher)
                         .await
                     {
