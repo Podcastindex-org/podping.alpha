@@ -52,8 +52,17 @@ impl GossipSender {
         tracing::debug!("GossipSender: broadcasting message ({} bytes)", data.len());
         self.api
             .call(act!(actor => async move {
-                    actor.gossip_sender
-                .broadcast(data.into()).await.map_err(|e| anyhow::anyhow!(e))
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    actor.gossip_sender.broadcast(data.into()),
+                ).await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(anyhow::anyhow!(e)),
+                    Err(_) => {
+                        tracing::warn!("GossipSender: broadcast timed out inside actor");
+                        Err(anyhow::anyhow!("broadcast timed out"))
+                    }
+                }
             }))
             .await
     }
@@ -66,7 +75,17 @@ impl GossipSender {
         );
         self.api
             .call(act!(actor => async move {
-                actor.gossip_sender.broadcast_neighbors(data.into()).await.map_err(|e| anyhow::anyhow!(e))
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    actor.gossip_sender.broadcast_neighbors(data.into()),
+                ).await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(anyhow::anyhow!(e)),
+                    Err(_) => {
+                        tracing::warn!("GossipSender: broadcast_neighbors timed out inside actor");
+                        Err(anyhow::anyhow!("broadcast_neighbors timed out"))
+                    }
+                }
             }))
             .await
     }
