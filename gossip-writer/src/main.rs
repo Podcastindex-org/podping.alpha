@@ -171,6 +171,7 @@ const BATCH_INTERVAL_SECS: u64 = 3;
 const RECONNECT_AFTER_FAILURES: u64 = 5;
 const BROADCAST_TIMEOUT_SECS: u64 = 10;
 const MAX_RETRY_QUEUE: usize = 500;
+const MAX_GOSSIP_PAYLOAD: usize = 60000; // Must stay under max_message_size (65536) with overhead
 
 // A pending IRI extracted from a ZMQ message, waiting to be batched
 struct PendingPing {
@@ -862,6 +863,54 @@ fn parse_zmq_message(
     }))
 }
 
+/// Split a list of IRIs into chunks that each produce a signed payload under MAX_GOSSIP_PAYLOAD.
+/// Uses a greedy approach: build up each chunk by adding IRIs until the next one would exceed the limit.
+fn split_iris_to_fit(
+    pubkey_hex: &str,
+    medium_str: &str,
+    reason_str: &str,
+    iris: &[String],
+    signing_key: &ed25519_dalek::SigningKey,
+) -> Vec<Vec<String>> {
+    // Try all IRIs in one batch first (common case)
+    {
+        let mut notif = notification::GossipNotification::new(pubkey_hex, medium_str, reason_str, iris.to_vec());
+        let payload = notif.sign(signing_key);
+        if payload.len() <= MAX_GOSSIP_PAYLOAD {
+            return vec![iris.to_vec()];
+        }
+    }
+
+    // Need to split — estimate how many IRIs fit per chunk using the envelope overhead
+    let mut chunks: Vec<Vec<String>> = Vec::new();
+    let mut current_chunk: Vec<String> = Vec::new();
+
+    for iri in iris {
+        current_chunk.push(iri.clone());
+
+        // Test if this chunk still fits
+        let mut test_notif = notification::GossipNotification::new(
+            pubkey_hex, medium_str, reason_str, current_chunk.clone(),
+        );
+        let test_payload = test_notif.sign(signing_key);
+
+        if test_payload.len() > MAX_GOSSIP_PAYLOAD {
+            // This IRI pushed it over — remove it and finalize the chunk
+            current_chunk.pop();
+            if !current_chunk.is_empty() {
+                chunks.push(current_chunk);
+            }
+            current_chunk = vec![iri.clone()];
+        }
+    }
+
+    if !current_chunk.is_empty() {
+        chunks.push(current_chunk);
+    }
+
+    chunks
+}
+
 // Flush the pending batch: group by (medium, reason), build one GossipNotification
 // per group, broadcast, then send a ZMQ reply for each IRI.
 fn flush_batch(
@@ -880,43 +929,59 @@ fn flush_batch(
             .push(ping.iri.clone());
     }
 
-    // Build, sign, archive, and broadcast one notification per group
+    // Build, sign, archive, and broadcast notifications per group.
+    // If a group's payload exceeds MAX_GOSSIP_PAYLOAD, split IRIs into chunks.
     let mut broadcast_ok = false;
     for ((medium_str, reason_str), iris) in &groups {
-        let iri_count = iris.len();
-        let mut notif =
-            notification::GossipNotification::new(pubkey_hex, medium_str, reason_str, iris.clone());
-        let signed_payload = notif.sign(signing_key);
+        let total_iri_count = iris.len();
 
-        if let Some(db) = db {
-            match db.store(
-                &signed_payload,
-                pubkey_hex,
-                medium_str,
-                reason_str,
-                notif.timestamp,
-                iri_count,
-            ) {
-                Ok(true) => println!("\x1b[36m[BATCH] Archived (new).\x1b[0m"),
-                Ok(false) => println!("\x1b[36m[BATCH] Archived (duplicate, skipped).\x1b[0m"),
-                Err(e) => eprintln!("\x1b[35m[WARN]  Archive error: {}\x1b[0m", e),
-            }
-        }
+        // Build chunks of IRIs that fit within the payload limit
+        let chunks = split_iris_to_fit(pubkey_hex, medium_str, reason_str, iris, signing_key);
 
-        match tx.try_send(signed_payload) {
-            Ok(_) => {
-                println!(
-                    "\x1b[32m[BATCH] Broadcast {} IRIs (medium={} reason={})\x1b[0m",
-                    iri_count, medium_str, reason_str
-                );
-                broadcast_ok = true;
+        for (chunk_idx, chunk_iris) in chunks.iter().enumerate() {
+            let chunk_count = chunk_iris.len();
+            let mut notif = notification::GossipNotification::new(
+                pubkey_hex, medium_str, reason_str, chunk_iris.clone(),
+            );
+            let signed_payload = notif.sign(signing_key);
+
+            if let Some(db) = db {
+                match db.store(
+                    &signed_payload,
+                    pubkey_hex,
+                    medium_str,
+                    reason_str,
+                    notif.timestamp,
+                    chunk_count,
+                ) {
+                    Ok(true) => println!("\x1b[36m[BATCH] Archived (new).\x1b[0m"),
+                    Ok(false) => println!("\x1b[36m[BATCH] Archived (duplicate, skipped).\x1b[0m"),
+                    Err(e) => eprintln!("\x1b[35m[WARN]  Archive error: {}\x1b[0m", e),
+                }
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                eprintln!("\x1b[1;31m[WARN]  Broadcast queue full — dropping batch. Gossip sender may be stalled.\x1b[0m");
-                broadcast_ok = true; // still send ZMQ replies so front-end doesn't stall
-            }
-            Err(e) => {
-                eprintln!("\x1b[35m[WARN]  Failed to queue batch for broadcast: {}\x1b[0m", e);
+
+            match tx.try_send(signed_payload) {
+                Ok(_) => {
+                    if chunks.len() > 1 {
+                        println!(
+                            "\x1b[32m[BATCH] Broadcast chunk {}/{}: {} IRIs (medium={} reason={}, {} total)\x1b[0m",
+                            chunk_idx + 1, chunks.len(), chunk_count, medium_str, reason_str, total_iri_count
+                        );
+                    } else {
+                        println!(
+                            "\x1b[32m[BATCH] Broadcast {} IRIs (medium={} reason={})\x1b[0m",
+                            chunk_count, medium_str, reason_str
+                        );
+                    }
+                    broadcast_ok = true;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    eprintln!("\x1b[1;31m[WARN]  Broadcast queue full — dropping batch. Gossip sender may be stalled.\x1b[0m");
+                    broadcast_ok = true;
+                }
+                Err(e) => {
+                    eprintln!("\x1b[35m[WARN]  Failed to queue batch for broadcast: {}\x1b[0m", e);
+                }
             }
         }
     }
