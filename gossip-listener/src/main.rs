@@ -429,11 +429,18 @@ async fn run_catchup(
 //Main ---------------------------------------------------------------------------------------------
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Write tracing output to fd 3 if TRACE_FD3=1 is set, otherwise stderr.
+    // Write tracing output to fd 3 only if TRACE_FD3=1 and fd 3 is a pipe or
+    // regular file, otherwise stderr. This avoids inherited sockets or other
+    // incompatible fds that reject write() with EINVAL.
     // Usage: TRACE_FD3=1 RUST_LOG=debug ./gossip-listener 3>trace.log
-    let trace_writer: Box<dyn std::io::Write + Send + Sync> =
-        if env::var("TRACE_FD3").as_deref() == Ok("1") {
-            Box::new(unsafe { std::fs::File::from_raw_fd(3) })
+    let trace_writer: Box<dyn std::io::Write + Send + Sync> = unsafe {
+        let mut stat: libc::stat = std::mem::zeroed();
+        let fd3_ok = env::var("TRACE_FD3").as_deref() == Ok("1") && libc::fstat(3, &mut stat) == 0 && {
+            let ft = stat.st_mode & libc::S_IFMT;
+            ft == libc::S_IFIFO || ft == libc::S_IFREG
+        };
+        if fd3_ok {
+            Box::new(std::fs::File::from_raw_fd(3))
         } else {
             Box::new(std::io::stderr())
         };
@@ -770,13 +777,16 @@ async fn main() -> anyhow::Result<()> {
         let watchdog_shared = shared_sender.clone();
         let watchdog_peers_file = peers_file.clone();
         let watchdog_bootstrap_str = bootstrap_peer_ids_str.clone();
+        let watchdog_failures = broadcast_failures.clone();
         tokio::spawn(async move {
+            let mut stall_count: u64 = 0;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(REBOOTSTRAP_TIMEOUT)).await;
                 let last = watchdog_last.load(Ordering::Relaxed);
                 let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                 if now - last >= REBOOTSTRAP_TIMEOUT {
-                    println!("\x1b[33m[WATCHDOG] No gossip notifications for {}s, re-bootstrapping...\x1b[0m", now - last);
+                    stall_count += 1;
+                    println!("\x1b[33m[WATCHDOG] No gossip notifications for {}s, re-bootstrapping (stall #{})...\x1b[0m", now - last, stall_count);
 
                     let mut peers: Vec<iroh::EndpointId> = watchdog_bootstrap_str
                         .split(',')
@@ -799,6 +809,16 @@ async fn main() -> anyhow::Result<()> {
                             eprintln!("\x1b[35m[WARN] Re-bootstrap failed: {}\x1b[0m", e);
                         }
                     }
+
+                    // If join_peers hasn't helped after two consecutive stalls, escalate to
+                    // a full reconnect by tripping the reconnect monitor's threshold
+                    if stall_count >= 2 {
+                        println!("\x1b[33m[WATCHDOG] Stall persists after re-bootstrap, triggering full reconnect...\x1b[0m");
+                        watchdog_failures.store(RECONNECT_AFTER_FAILURES, Ordering::Relaxed);
+                        stall_count = 0;
+                    }
+                } else {
+                    stall_count = 0;
                 }
             }
         });

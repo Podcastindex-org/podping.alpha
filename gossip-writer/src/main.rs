@@ -184,11 +184,20 @@ struct PendingPing {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Write tracing output to fd 3 if TRACE_FD3=1 is set, otherwise stderr.
+    // Write tracing output to fd 3 only if TRACE_FD3=1 and fd 3 is a pipe or
+    // regular file, otherwise stderr. This avoids inherited sockets or other
+    // incompatible fds that reject write() with EINVAL.
     // Usage: TRACE_FD3=1 RUST_LOG=debug ./gossip-writer 3>trace.log
-    let trace_writer: Box<dyn std::io::Write + Send + Sync> =
-        if std::env::var("TRACE_FD3").as_deref() == Ok("1") {
-            Box::new(unsafe { std::fs::File::from_raw_fd(3) })
+    let trace_writer: Box<dyn std::io::Write + Send + Sync> = unsafe {
+        let mut stat: libc::stat = std::mem::zeroed();
+        let fd3_ok = std::env::var("TRACE_FD3").as_deref() == Ok("1")
+            && libc::fstat(3, &mut stat) == 0
+            && {
+            let ft = stat.st_mode & libc::S_IFMT;
+            ft == libc::S_IFIFO || ft == libc::S_IFREG
+        };
+        if fd3_ok {
+            Box::new(std::fs::File::from_raw_fd(3))
         } else {
             Box::new(std::io::stderr())
         };
