@@ -339,7 +339,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .spawn(endpoint.clone());
 
     // Register gossip protocol with the router for incoming connections
-    let _router = Router::builder(endpoint.clone())
+    let router = Router::builder(endpoint.clone())
         .accept(iroh_gossip::ALPN, gossip.clone())
         .spawn();
 
@@ -441,6 +441,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reconnect_last_notif = last_notification_time.clone();
     let reconnect_peer_names = peer_names.clone();
     tokio::spawn(async move {
+        // Keep the router alive in this task; on reconnect we replace it
+        // (dropping the old router aborts its accept loop without closing the endpoint)
+        let mut _current_router = router;
         let mut consecutive_failures: u64 = 0;
         let mut retry_queue: VecDeque<Vec<u8>> = VecDeque::new();
         let timeout_dur = std::time::Duration::from_secs(BROADCAST_TIMEOUT_SECS);
@@ -506,7 +509,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .max_message_size(65536)
                     .spawn(reconnect_endpoint.clone());
                 // Re-register the new gossip with a fresh Router for incoming connections
-                let _new_router = Router::builder(reconnect_endpoint.clone())
+                // Replace the router: dropping the old one stops its accept loop,
+                // the new one routes incoming gossip connections to the fresh actor
+                _current_router = Router::builder(reconnect_endpoint.clone())
                     .accept(iroh_gossip::ALPN, new_gossip.clone())
                     .spawn();
                 match new_gossip

@@ -611,7 +611,7 @@ async fn main() -> anyhow::Result<()> {
         println!("  Archive sync: serving on ALPN {}", std::str::from_utf8(ARCHIVE_SYNC_ALPN).unwrap());
     }
 
-    let _router = router_builder.spawn();
+    let router = router_builder.spawn();
 
     // Bootstrap this node over DHT
     let dht_signing_key = ed25519_dalek::SigningKey::from_bytes(&node_key_bytes);
@@ -841,6 +841,9 @@ async fn main() -> anyhow::Result<()> {
         let reconnect_sse_tx = sse_tx.clone();
         let reconnect_notif_count = notifications_received.clone();
         tokio::spawn(async move {
+            // Keep the router alive in this task; on reconnect we replace it
+            // (dropping the old router aborts its accept loop without closing the endpoint)
+            let mut _current_router = router;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 let failures = reconnect_failures.load(Ordering::Relaxed);
@@ -867,7 +870,9 @@ async fn main() -> anyhow::Result<()> {
                         let handler = ArchiveSyncHandler { db: db_arc.clone() };
                         new_router_builder = new_router_builder.accept(ARCHIVE_SYNC_ALPN, handler);
                     }
-                    let _new_router = new_router_builder.spawn();
+                    // Replace the router: dropping the old one stops its accept loop,
+                    // the new one routes incoming connections to the fresh actor
+                    _current_router = new_router_builder.spawn();
                     match new_gossip
                         .subscribe_and_join_with_auto_discovery_no_wait(publisher)
                         .await
