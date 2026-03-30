@@ -1,11 +1,16 @@
 mod archive;
 mod notification;
 
+use distributed_topic_tracker::{AutoDiscoveryGossip, RecordPublisher, TopicId as DttTopicId};
+use distributed_topic_tracker::{
+    GossipReceiver as DttGossipReceiver, GossipSender as DttGossipSender,
+};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use iroh::protocol::Router;
 use iroh::SecretKey;
-use iroh_gossip::net::Gossip;
 use iroh_gossip::api::Event;
-use distributed_topic_tracker::{GossipSender as DttGossipSender, GossipReceiver as DttGossipReceiver};
+use iroh_gossip::net::Gossip;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::fs;
@@ -14,12 +19,9 @@ use std::os::unix::io::FromRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use tokio::signal;
-use tokio::sync::mpsc;
-use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use distributed_topic_tracker::{AutoDiscoveryGossip, RecordPublisher, TopicId as DttTopicId};
+use tokio::signal;
+use tokio::sync::{mpsc, Notify};
 
 // Cap'n Proto plexo message wrapper
 pub mod plexo_message_capnp {
@@ -28,10 +30,10 @@ pub mod plexo_message_capnp {
 use crate::plexo_message_capnp::plexo_message;
 
 // Podping schema types for deserialization
-use podping_schemas::org::podcastindex::podping::podping_write_capnp::podping_write;
+use podping_schemas::org::podcastindex::podping::hivewriter::podping_hive_transaction_capnp::podping_hive_transaction;
 use podping_schemas::org::podcastindex::podping::podping_medium_capnp::PodpingMedium;
 use podping_schemas::org::podcastindex::podping::podping_reason_capnp::PodpingReason;
-use podping_schemas::org::podcastindex::podping::hivewriter::podping_hive_transaction_capnp::podping_hive_transaction;
+use podping_schemas::org::podcastindex::podping::podping_write_capnp::podping_write;
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -88,7 +90,13 @@ impl PeerAnnounce {
         }
     }
 
-    fn new_endorse(node_id: &str, version: &str, sender: &str, endorsed_keys: Vec<String>, friendly_name: Option<String>) -> Self {
+    fn new_endorse(
+        node_id: &str,
+        version: &str,
+        sender: &str,
+        endorsed_keys: Vec<String>,
+        friendly_name: Option<String>,
+    ) -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -109,7 +117,10 @@ impl PeerAnnounce {
         let canonical = CanonicalPeerEndorse {
             friendly_name: self.friendly_name.as_deref(),
             node_id: &self.node_id,
-            node_list: self.node_list.as_ref().expect("node_list required for endorse"),
+            node_list: self
+                .node_list
+                .as_ref()
+                .expect("node_list required for endorse"),
             sender: self.sender.as_ref().expect("sender required for endorse"),
             timestamp: self.timestamp,
             msg_type: &self.msg_type,
@@ -182,16 +193,56 @@ struct PendingPing {
     reason_raw: u16,
 }
 
+async fn reconnect_gossip_topic(
+    endpoint: iroh::Endpoint,
+    node_key_bytes: [u8; 32],
+    dht_initial_secret: String,
+) -> Result<(DttGossipSender, DttGossipReceiver, Router), Box<dyn std::error::Error + Send + Sync>>
+{
+    let dht_key = ed25519_dalek::SigningKey::from_bytes(&node_key_bytes);
+    let dtt_topic = DttTopicId::new(TOPIC_STRING.to_string());
+    let publisher = RecordPublisher::new(
+        dtt_topic,
+        dht_key.verifying_key(),
+        dht_key,
+        None,
+        dht_initial_secret.into_bytes(),
+    );
+
+    let new_gossip = Gossip::builder()
+        .max_message_size(65536)
+        .spawn(endpoint.clone());
+    let new_router = Router::builder(endpoint.clone())
+        .accept(iroh_gossip::ALPN, new_gossip.clone())
+        .spawn();
+    let new_topic = new_gossip
+        .subscribe_and_join_with_auto_discovery_no_wait(publisher)
+        .await?;
+    let (new_sender, new_receiver) = new_topic.split().await?;
+
+    Ok((new_sender, new_receiver, new_router))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Write tracing output to fd 3 if TRACE_FD3=1 is set, otherwise stderr.
+    // Write tracing output to fd 3 only if TRACE_FD3=1 and fd 3 is a pipe or
+    // regular file, otherwise stderr. This avoids inherited sockets or other
+    // incompatible fds that reject write() with EINVAL.
     // Usage: TRACE_FD3=1 RUST_LOG=debug ./gossip-writer 3>trace.log
-    let trace_writer: Box<dyn std::io::Write + Send + Sync> =
-        if std::env::var("TRACE_FD3").as_deref() == Ok("1") {
-            Box::new(unsafe { std::fs::File::from_raw_fd(3) })
+    let trace_writer: Box<dyn std::io::Write + Send + Sync> = unsafe {
+        let mut stat: libc::stat = std::mem::zeroed();
+        let fd3_ok = std::env::var("TRACE_FD3").as_deref() == Ok("1")
+            && libc::fstat(3, &mut stat) == 0
+            && {
+                let ft = stat.st_mode & libc::S_IFMT;
+                ft == libc::S_IFIFO || ft == libc::S_IFREG
+            };
+        if fd3_ok {
+            Box::new(std::fs::File::from_raw_fd(3))
         } else {
             Box::new(std::io::stderr())
-        };
+        }
+    };
     let trace_writer = std::sync::Mutex::new(trace_writer);
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -212,14 +263,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             "unknown".to_string()
         };
-        let location = info.location()
+        let location = info
+            .location()
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_else(|| "unknown location".to_string());
         let is_iroh = location.contains("iroh-quinn") || payload.contains("drained connections");
-        let is_actor_shutdown = payload.contains("actor stopped")
-            || payload.contains("must not be polled after");
+        let is_actor_shutdown =
+            payload.contains("actor stopped") || payload.contains("must not be polled after");
         if is_iroh {
-            eprintln!("\x1b[1;31m[PANIC] Known iroh-quinn 0.16.1 bug at {}: {}\x1b[0m", location, payload);
+            eprintln!(
+                "\x1b[1;31m[PANIC] Known iroh-quinn 0.16.1 bug at {}: {}\x1b[0m",
+                location, payload
+            );
             eprintln!("\x1b[1;31m[PANIC] This is an upstream bug, not a gossip-writer issue. Process will restart via Docker.\x1b[0m");
         } else if is_actor_shutdown {
             // DTT's internal actors panic when the gossip system shuts down — benign during exit
@@ -246,10 +301,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(300);
-    let dht_initial_secret = env::var("DHT_INITIAL_SECRET")
-        .unwrap_or_else(|_| DEFAULT_DHT_SECRET.to_string());
-    let trusted_publishers_file =
-        env::var("TRUSTED_PUBLISHERS_FILE").unwrap_or_else(|_| DEFAULT_TRUSTED_PUBLISHERS_FILE.to_string());
+    let dht_initial_secret =
+        env::var("DHT_INITIAL_SECRET").unwrap_or_else(|_| DEFAULT_DHT_SECRET.to_string());
+    let trusted_publishers_file = env::var("TRUSTED_PUBLISHERS_FILE")
+        .unwrap_or_else(|_| DEFAULT_TRUSTED_PUBLISHERS_FILE.to_string());
     let peer_endorse_interval: u64 = env::var("PEER_ENDORSE_INTERVAL")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -273,13 +328,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
 
-    let trusted_publishers = Arc::new(RwLock::new(load_trusted_publishers(&trusted_publishers_file)));
+    let trusted_publishers = Arc::new(RwLock::new(load_trusted_publishers(
+        &trusted_publishers_file,
+    )));
 
     println!("gossip-writer v{}", env!("CARGO_PKG_VERSION"));
     println!("  ZMQ bind:     {}", zmq_bind);
     println!("  Key file:     {}", key_file);
     println!("  Node key:     {}", node_key_file);
-    println!("  Archive:      {}", if archive_enabled { &archive_path } else { "disabled" });
+    println!(
+        "  Archive:      {}",
+        if archive_enabled {
+            &archive_path
+        } else {
+            "disabled"
+        }
+    );
     println!("  Peers file:   {}", peers_file);
     println!("  Topic:        {}", TOPIC_STRING);
     println!("  Announce interval: {}s", peer_announce_interval);
@@ -330,7 +394,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .spawn(endpoint.clone());
 
     // Register gossip protocol with the router for incoming connections
-    let _router = Router::builder(endpoint.clone())
+    let router = Router::builder(endpoint.clone())
         .accept(iroh_gossip::ALPN, gossip.clone())
         .spawn();
 
@@ -356,6 +420,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Shared sender so watchdog and broadcast task can both use (and reconnect can replace) it
     let shared_sender: Arc<tokio::sync::RwLock<DttGossipSender>> =
         Arc::new(tokio::sync::RwLock::new(gossip_sender));
+    let broadcast_failures = Arc::new(AtomicU64::new(0));
+    let reconnect_requested = Arc::new(AtomicBool::new(false));
+    let reconnect_notify = Arc::new(Notify::new());
+    let receive_generation = Arc::new(AtomicU64::new(0));
 
     // --- Optionally join bootstrap peers ---
     let mut bootstrap_peers: Vec<iroh::EndpointId> = bootstrap_peer_ids_str
@@ -390,8 +458,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown_zmq = shutdown.clone();
 
     // --- Re-bootstrap watchdog timer ---
-    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let last_notification_time = Arc::new(AtomicU64::new(now_secs));
+    let initial_receive_generation = receive_generation.fetch_add(1, Ordering::Relaxed) + 1;
 
     // Peer friendly name tracking
     let peer_names: Arc<RwLock<HashMap<String, String>>> = Arc::new(RwLock::new(HashMap::new()));
@@ -412,6 +484,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auto_trust_endorsements,
         last_notification_time.clone(),
         peer_names.clone(),
+        broadcast_failures.clone(),
+        reconnect_requested.clone(),
+        reconnect_notify.clone(),
+        receive_generation.clone(),
+        initial_receive_generation,
     );
 
     // --- Async broadcast task (with reconnection) ---
@@ -421,6 +498,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bcast_failed = health_broadcasts_failed.clone();
     let bcast_last_ok = health_last_broadcast_ok.clone();
     let bcast_alive = health_broadcast_task_alive.clone();
+    let bcast_failure_count = broadcast_failures.clone();
+    let bcast_reconnect_requested = reconnect_requested.clone();
+    let bcast_reconnect_notify = reconnect_notify.clone();
     let reconnect_endpoint = endpoint.clone();
     let reconnect_node_key_bytes = node_key_bytes;
     let reconnect_dht_secret = dht_initial_secret.clone();
@@ -431,81 +511,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reconnect_auto_trust = auto_trust_endorsements;
     let reconnect_last_notif = last_notification_time.clone();
     let reconnect_peer_names = peer_names.clone();
+    let reconnect_receive_generation = receive_generation.clone();
     tokio::spawn(async move {
+        // Keep the router alive in this task; on reconnect we replace it
+        // (dropping the old router aborts its accept loop without closing the endpoint)
+        let mut _current_router = router;
         let mut consecutive_failures: u64 = 0;
         let mut retry_queue: VecDeque<Vec<u8>> = VecDeque::new();
         let timeout_dur = std::time::Duration::from_secs(BROADCAST_TIMEOUT_SECS);
 
-        while let Some(payload) = rx.recv().await {
-            if broadcast_shutdown.load(Ordering::Relaxed) {
-                break;
-            }
-
-            // Try the new payload
-            let result = {
-                let sender = broadcast_shared.read().await;
-                tokio::time::timeout(timeout_dur, sender.broadcast(payload.clone())).await
-            };
-            match result {
-                Ok(Ok(_)) => {
-                    bcast_sent.fetch_add(1, Ordering::Relaxed);
-                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-                    bcast_last_ok.store(now, Ordering::Relaxed);
-                    if consecutive_failures >= 3 {
-                        println!("\x1b[32m[BROADCAST] Gossip broadcast recovered after {} failures\x1b[0m", consecutive_failures);
+        loop {
+            tokio::select! {
+                _ = bcast_reconnect_notify.notified() => {
+                    if !bcast_reconnect_requested.swap(false, Ordering::Relaxed) {
+                        continue;
                     }
-                    consecutive_failures = 0;
-                }
-                Ok(Err(e)) => {
-                    bcast_failed.fetch_add(1, Ordering::Relaxed);
-                    consecutive_failures += 1;
-                    // Queue for retry
-                    if retry_queue.len() < MAX_RETRY_QUEUE {
-                        retry_queue.push_back(payload);
-                    }
-                    if consecutive_failures <= 3 {
-                        eprintln!("\x1b[35m[WARN] Gossip broadcast error: {}\x1b[0m", e);
-                    }
-                }
-                Err(_) => {
-                    // Timeout — broadcast hung
-                    bcast_failed.fetch_add(1, Ordering::Relaxed);
-                    consecutive_failures += 1;
-                    if retry_queue.len() < MAX_RETRY_QUEUE {
-                        retry_queue.push_back(payload);
-                    }
-                    if consecutive_failures <= 3 {
-                        eprintln!("\x1b[35m[WARN] Gossip broadcast timed out ({}s)\x1b[0m", BROADCAST_TIMEOUT_SECS);
-                    }
-                }
-            }
-
-            // Reconnect if enough consecutive failures
-            if consecutive_failures == RECONNECT_AFTER_FAILURES {
-                eprintln!("\x1b[1;31m[RECONNECT] {} consecutive broadcast failures — reconnecting gossip topic...\x1b[0m", consecutive_failures);
-                let dht_key = ed25519_dalek::SigningKey::from_bytes(&reconnect_node_key_bytes);
-                let dtt_topic = DttTopicId::new(TOPIC_STRING.to_string());
-                let publisher = RecordPublisher::new(
-                    dtt_topic,
-                    dht_key.verifying_key(),
-                    dht_key,
-                    None,
-                    reconnect_dht_secret.clone().into_bytes(),
-                );
-                // Spawn a fresh Gossip actor (the old one is dead after all topics quit)
-                let new_gossip = Gossip::builder()
-                    .max_message_size(65536)
-                    .spawn(reconnect_endpoint.clone());
-                // Re-register the new gossip with a fresh Router for incoming connections
-                let _new_router = Router::builder(reconnect_endpoint.clone())
-                    .accept(iroh_gossip::ALPN, new_gossip.clone())
-                    .spawn();
-                match new_gossip
-                    .subscribe_and_join_with_auto_discovery_no_wait(publisher)
-                    .await
-                {
-                    Ok(new_topic) => match new_topic.split().await {
-                        Ok((new_sender, new_receiver)) => {
+                    eprintln!("\x1b[1;31m[RECONNECT] Watchdog requested full reconnect after repeated stalls...\x1b[0m");
+                    match reconnect_gossip_topic(
+                        reconnect_endpoint.clone(),
+                        reconnect_node_key_bytes,
+                        reconnect_dht_secret.clone(),
+                    ).await {
+                        Ok((new_sender, new_receiver, new_router)) => {
+                            _current_router = new_router;
                             {
                                 let mut sender_guard = broadcast_shared.write().await;
                                 *sender_guard = new_sender;
@@ -520,43 +548,140 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 reconnect_auto_trust,
                                 reconnect_last_notif.clone(),
                                 reconnect_peer_names.clone(),
+                                bcast_failure_count.clone(),
+                                bcast_reconnect_requested.clone(),
+                                bcast_reconnect_notify.clone(),
+                                reconnect_receive_generation.clone(),
+                                reconnect_receive_generation.fetch_add(1, Ordering::Relaxed) + 1,
                             );
 
-                            // Drain retry queue through new sender
-                            let queued = retry_queue.len();
-                            if queued > 0 {
-                                println!("\x1b[32m[RECONNECT] Replaying {} queued broadcasts...\x1b[0m", queued);
-                                let sender = broadcast_shared.read().await;
-                                let mut replayed = 0;
-                                while let Some(queued_payload) = retry_queue.pop_front() {
-                                    match tokio::time::timeout(timeout_dur, sender.broadcast(queued_payload.clone())).await {
-                                        Ok(Ok(_)) => {
-                                            bcast_sent.fetch_add(1, Ordering::Relaxed);
-                                            replayed += 1;
-                                        }
-                                        _ => {
-                                            // New sender also failing — put it back and stop
-                                            retry_queue.push_front(queued_payload);
-                                            break;
-                                        }
-                                    }
-                                }
-                                println!("\x1b[32m[RECONNECT] Replayed {}/{} queued broadcasts\x1b[0m", replayed, queued);
-                            }
-
                             consecutive_failures = 0;
-                            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-                            bcast_last_ok.store(now, Ordering::Relaxed);
+                            bcast_failure_count.store(0, Ordering::Relaxed);
                             println!("\x1b[32m[RECONNECT] Gossip topic reconnected successfully.\x1b[0m");
                         }
                         Err(e) => {
-                            eprintln!("\x1b[1;31m[RECONNECT] Failed to split topic: {}. Will retry.\x1b[0m", e);
+                            eprintln!("\x1b[1;31m[RECONNECT] Failed to reconnect gossip topic: {}. Will retry after the next stall or broadcast failure.\x1b[0m", e);
                             consecutive_failures = 0;
+                            bcast_failure_count.store(0, Ordering::Relaxed);
                         }
-                    },
-                    Err(e) => {
-                        eprintln!("\x1b[1;31m[RECONNECT] Failed to re-subscribe: {}. Will retry on next batch.\x1b[0m", e);
-                        consecutive_failures = 0;
+                    }
+                }
+                maybe_payload = rx.recv() => {
+                    let Some(payload) = maybe_payload else {
+                        break;
+                    };
+
+                    if broadcast_shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    // Try the new payload
+                    let result = {
+                        let sender = broadcast_shared.read().await;
+                        tokio::time::timeout(timeout_dur, sender.broadcast(payload.clone())).await
+                    };
+                    match result {
+                        Ok(Ok(_)) => {
+                            bcast_sent.fetch_add(1, Ordering::Relaxed);
+                            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                            bcast_last_ok.store(now, Ordering::Relaxed);
+                            if consecutive_failures >= 3 {
+                                println!("\x1b[32m[BROADCAST] Gossip broadcast recovered after {} failures\x1b[0m", consecutive_failures);
+                            }
+                            consecutive_failures = 0;
+                            bcast_failure_count.store(0, Ordering::Relaxed);
+                        }
+                        Ok(Err(e)) => {
+                            bcast_failed.fetch_add(1, Ordering::Relaxed);
+                            consecutive_failures += 1;
+                            bcast_failure_count.store(consecutive_failures, Ordering::Relaxed);
+                            // Queue for retry
+                            if retry_queue.len() < MAX_RETRY_QUEUE {
+                                retry_queue.push_back(payload);
+                            }
+                            if consecutive_failures <= 3 {
+                                eprintln!("\x1b[35m[WARN] Gossip broadcast error: {}\x1b[0m", e);
+                            }
+                        }
+                        Err(_) => {
+                            // Timeout — broadcast hung
+                            bcast_failed.fetch_add(1, Ordering::Relaxed);
+                            consecutive_failures += 1;
+                            bcast_failure_count.store(consecutive_failures, Ordering::Relaxed);
+                            if retry_queue.len() < MAX_RETRY_QUEUE {
+                                retry_queue.push_back(payload);
+                            }
+                            if consecutive_failures <= 3 {
+                                eprintln!("\x1b[35m[WARN] Gossip broadcast timed out ({}s)\x1b[0m", BROADCAST_TIMEOUT_SECS);
+                            }
+                        }
+                    }
+
+                    // Reconnect if enough consecutive failures
+                    if consecutive_failures == RECONNECT_AFTER_FAILURES {
+                        eprintln!("\x1b[1;31m[RECONNECT] {} consecutive broadcast failures — reconnecting gossip topic...\x1b[0m", consecutive_failures);
+                        match reconnect_gossip_topic(
+                            reconnect_endpoint.clone(),
+                            reconnect_node_key_bytes,
+                            reconnect_dht_secret.clone(),
+                        ).await {
+                            Ok((new_sender, new_receiver, new_router)) => {
+                                _current_router = new_router;
+                                {
+                                    let mut sender_guard = broadcast_shared.write().await;
+                                    *sender_guard = new_sender;
+                                }
+
+                                spawn_receive_task(
+                                    new_receiver,
+                                    reconnect_peers_file.clone(),
+                                    reconnect_my_node_id,
+                                    reconnect_trusted.clone(),
+                                    reconnect_trusted_file.clone(),
+                                    reconnect_auto_trust,
+                                    reconnect_last_notif.clone(),
+                                    reconnect_peer_names.clone(),
+                                    bcast_failure_count.clone(),
+                                    bcast_reconnect_requested.clone(),
+                                    bcast_reconnect_notify.clone(),
+                                    reconnect_receive_generation.clone(),
+                                    reconnect_receive_generation.fetch_add(1, Ordering::Relaxed) + 1,
+                                );
+
+                                // Drain retry queue through new sender
+                                let queued = retry_queue.len();
+                                if queued > 0 {
+                                    println!("\x1b[32m[RECONNECT] Replaying {} queued broadcasts...\x1b[0m", queued);
+                                    let sender = broadcast_shared.read().await;
+                                    let mut replayed = 0;
+                                    while let Some(queued_payload) = retry_queue.pop_front() {
+                                        match tokio::time::timeout(timeout_dur, sender.broadcast(queued_payload.clone())).await {
+                                            Ok(Ok(_)) => {
+                                                bcast_sent.fetch_add(1, Ordering::Relaxed);
+                                                replayed += 1;
+                                            }
+                                            _ => {
+                                                // New sender also failing — put it back and stop
+                                                retry_queue.push_front(queued_payload);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    println!("\x1b[32m[RECONNECT] Replayed {}/{} queued broadcasts\x1b[0m", replayed, queued);
+                                }
+
+                                consecutive_failures = 0;
+                                bcast_failure_count.store(0, Ordering::Relaxed);
+                                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                                bcast_last_ok.store(now, Ordering::Relaxed);
+                                println!("\x1b[32m[RECONNECT] Gossip topic reconnected successfully.\x1b[0m");
+                            }
+                            Err(e) => {
+                                eprintln!("\x1b[1;31m[RECONNECT] Failed to reconnect gossip topic: {}. Will retry on next batch.\x1b[0m", e);
+                                consecutive_failures = 0;
+                                bcast_failure_count.store(0, Ordering::Relaxed);
+                            }
+                        }
                     }
                 }
             }
@@ -572,16 +697,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(peer_announce_interval)).await;
-                let announce = PeerAnnounce::new(&announce_node_id, env!("CARGO_PKG_VERSION"), announce_friendly.clone());
+                let announce = PeerAnnounce::new(
+                    &announce_node_id,
+                    env!("CARGO_PKG_VERSION"),
+                    announce_friendly.clone(),
+                );
                 match serde_json::to_vec(&announce) {
                     Ok(payload) => {
                         if let Err(e) = announce_tx.send(payload).await {
                             eprintln!("\x1b[35m[WARN] Failed to queue PeerAnnounce: {}\x1b[0m", e);
                         } else {
-                            println!("\x1b[33m[ANNOUNCE] Broadcast PeerAnnounce for {}\x1b[0m", announce_node_id);
+                            println!(
+                                "\x1b[33m[ANNOUNCE] Broadcast PeerAnnounce for {}\x1b[0m",
+                                announce_node_id
+                            );
                         }
                     }
-                    Err(e) => eprintln!("\x1b[35m[WARN] Failed to serialize PeerAnnounce: {}\x1b[0m", e),
+                    Err(e) => eprintln!(
+                        "\x1b[35m[WARN] Failed to serialize PeerAnnounce: {}\x1b[0m",
+                        e
+                    ),
                 }
             }
         });
@@ -618,10 +753,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Err(e) = endorse_tx.send(payload).await {
                             eprintln!("\x1b[35m[WARN] Failed to queue PeerEndorse: {}\x1b[0m", e);
                         } else {
-                            println!("\x1b[32m[ENDORSE] Broadcast PeerEndorse ({} keys)\x1b[0m", endorse.node_list.as_ref().map_or(0, |l| l.len()));
+                            println!(
+                                "\x1b[32m[ENDORSE] Broadcast PeerEndorse ({} keys)\x1b[0m",
+                                endorse.node_list.as_ref().map_or(0, |l| l.len())
+                            );
                         }
                     }
-                    Err(e) => eprintln!("\x1b[35m[WARN] Failed to serialize PeerEndorse: {}\x1b[0m", e),
+                    Err(e) => eprintln!(
+                        "\x1b[35m[WARN] Failed to serialize PeerEndorse: {}\x1b[0m",
+                        e
+                    ),
                 }
             }
         });
@@ -633,13 +774,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let watchdog_shared = shared_sender.clone();
         let watchdog_peers_file = peers_file.clone();
         let watchdog_bootstrap_str = bootstrap_peer_ids_str.clone();
+        let watchdog_failures = broadcast_failures.clone();
+        let watchdog_reconnect_requested = reconnect_requested.clone();
+        let watchdog_reconnect_notify = reconnect_notify.clone();
         tokio::spawn(async move {
+            let mut stall_count: u64 = 0;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(REBOOTSTRAP_TIMEOUT)).await;
                 let last = watchdog_last.load(Ordering::Relaxed);
-                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
                 if now - last >= REBOOTSTRAP_TIMEOUT {
-                    println!("\x1b[33m[WATCHDOG] No gossip notifications for {}s, re-bootstrapping...\x1b[0m", now - last);
+                    stall_count += 1;
+                    println!("\x1b[33m[WATCHDOG] No gossip notifications for {}s, re-bootstrapping (stall #{})...\x1b[0m", now - last, stall_count);
 
                     let mut peers: Vec<iroh::EndpointId> = watchdog_bootstrap_str
                         .split(',')
@@ -656,12 +805,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if peers.is_empty() {
                         println!("\x1b[33m[WATCHDOG] No known peers to re-bootstrap with\x1b[0m");
                     } else {
-                        println!("\x1b[33m[WATCHDOG] Re-joining {} peers...\x1b[0m", peers.len());
+                        println!(
+                            "\x1b[33m[WATCHDOG] Re-joining {} peers...\x1b[0m",
+                            peers.len()
+                        );
                         let sender = watchdog_shared.read().await;
                         if let Err(e) = sender.join_peers(peers, None).await {
                             eprintln!("\x1b[35m[WARN] Re-bootstrap failed: {}\x1b[0m", e);
                         }
                     }
+
+                    if stall_count >= 2 {
+                        println!("\x1b[33m[WATCHDOG] Stall persists after re-bootstrap, triggering full reconnect...\x1b[0m");
+                        watchdog_failures.store(RECONNECT_AFTER_FAILURES, Ordering::Relaxed);
+                        watchdog_reconnect_requested.store(true, Ordering::Relaxed);
+                        watchdog_reconnect_notify.notify_one();
+                        stall_count = 0;
+                    }
+                } else {
+                    stall_count = 0;
                 }
             }
         });
@@ -689,7 +851,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let failed = h_failed.load(Ordering::Relaxed);
                 let last_ok = h_last_ok.load(Ordering::Relaxed);
                 let alive = h_alive.load(Ordering::Relaxed);
-                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
                 let since_last = now.saturating_sub(last_ok);
                 let delta_sent = sent - prev_sent;
                 let delta_failed = failed - prev_failed;
@@ -835,7 +1000,10 @@ fn parse_zmq_message(
     let payload_type = plexo_msg.get_type_name()?.to_str()?;
 
     if payload_type != "org.podcastindex.podping.hivewriter.PodpingWrite.capnp" {
-        eprintln!("\x1b[35m[WARN] Ignoring non-PodpingWrite message: {}\x1b[0m", payload_type);
+        eprintln!(
+            "\x1b[35m[WARN] Ignoring non-PodpingWrite message: {}\x1b[0m",
+            payload_type
+        );
         return Ok(None);
     }
 
@@ -874,7 +1042,12 @@ fn split_iris_to_fit(
 ) -> Vec<Vec<String>> {
     // Try all IRIs in one batch first (common case)
     {
-        let mut notif = notification::GossipNotification::new(pubkey_hex, medium_str, reason_str, iris.to_vec());
+        let mut notif = notification::GossipNotification::new(
+            pubkey_hex,
+            medium_str,
+            reason_str,
+            iris.to_vec(),
+        );
         let payload = notif.sign(signing_key);
         if payload.len() <= MAX_GOSSIP_PAYLOAD {
             return vec![iris.to_vec()];
@@ -890,7 +1063,10 @@ fn split_iris_to_fit(
 
         // Test if this chunk still fits
         let mut test_notif = notification::GossipNotification::new(
-            pubkey_hex, medium_str, reason_str, current_chunk.clone(),
+            pubkey_hex,
+            medium_str,
+            reason_str,
+            current_chunk.clone(),
         );
         let test_payload = test_notif.sign(signing_key);
 
@@ -924,7 +1100,8 @@ fn flush_batch(
     // Group IRIs by (medium_str, reason_str)
     let mut groups: HashMap<(&'static str, &'static str), Vec<String>> = HashMap::new();
     for ping in pending.iter() {
-        groups.entry((ping.medium_str, ping.reason_str))
+        groups
+            .entry((ping.medium_str, ping.reason_str))
             .or_default()
             .push(ping.iri.clone());
     }
@@ -941,7 +1118,10 @@ fn flush_batch(
         for (chunk_idx, chunk_iris) in chunks.iter().enumerate() {
             let chunk_count = chunk_iris.len();
             let mut notif = notification::GossipNotification::new(
-                pubkey_hex, medium_str, reason_str, chunk_iris.clone(),
+                pubkey_hex,
+                medium_str,
+                reason_str,
+                chunk_iris.clone(),
             );
             let signed_payload = notif.sign(signing_key);
 
@@ -980,7 +1160,10 @@ fn flush_batch(
                     broadcast_ok = true;
                 }
                 Err(e) => {
-                    eprintln!("\x1b[35m[WARN]  Failed to queue batch for broadcast: {}\x1b[0m", e);
+                    eprintln!(
+                        "\x1b[35m[WARN]  Failed to queue batch for broadcast: {}\x1b[0m",
+                        e
+                    );
                 }
             }
         }
@@ -1001,14 +1184,21 @@ fn flush_batch(
             let medium_enum = PodpingMedium::try_from(ping.medium_raw).unwrap();
             let reason_enum = PodpingReason::try_from(ping.reason_raw).unwrap();
 
-            if let Err(e) = send_zmq_reply(socket, &ping.iri, medium_enum, reason_enum, timestamp_secs, timestamp_ns) {
-                eprintln!("\x1b[35m[WARN]  Failed to send reply for {}: {}\x1b[0m", ping.iri, e);
+            if let Err(e) = send_zmq_reply(
+                socket,
+                &ping.iri,
+                medium_enum,
+                reason_enum,
+                timestamp_secs,
+                timestamp_ns,
+            ) {
+                eprintln!(
+                    "\x1b[35m[WARN]  Failed to send reply for {}: {}\x1b[0m",
+                    ping.iri, e
+                );
             }
         }
-        println!(
-            "\x1b[36m[BATCH] Sent {} ZMQ replies\x1b[0m",
-            pending.len()
-        );
+        println!("\x1b[36m[BATCH] Sent {} ZMQ replies\x1b[0m", pending.len());
     }
 
     pending.clear();
@@ -1152,7 +1342,8 @@ fn load_or_create_node_key(path: &str) -> Result<SecretKey, Box<dyn std::error::
             }
         }
         // Fall back to raw 32-byte format
-        let key_bytes: [u8; 32] = raw.try_into()
+        let key_bytes: [u8; 32] = raw
+            .try_into()
             .map_err(|_| format!("key file {} has invalid length", path))?;
         println!("  Loaded iroh node key from {}", path);
         Ok(SecretKey::from_bytes(&key_bytes))
@@ -1178,6 +1369,11 @@ fn spawn_receive_task(
     auto_trust_endorsements: bool,
     last_notification_time: Arc<AtomicU64>,
     peer_names: Arc<RwLock<HashMap<String, String>>>,
+    reconnect_failures: Arc<AtomicU64>,
+    reconnect_requested: Arc<AtomicBool>,
+    reconnect_notify: Arc<Notify>,
+    receive_generation_counter: Arc<AtomicU64>,
+    receive_generation: u64,
 ) {
     tokio::spawn(async move {
         while let Some(event) = receiver.next().await {
@@ -1187,11 +1383,17 @@ fn spawn_receive_task(
                     if let Ok(announce) = serde_json::from_slice::<PeerAnnounce>(&msg.content) {
                         if announce.msg_type == "peer_announce" {
                             if let Some(ref name) = announce.friendly_name {
-                                println!("\x1b[33m[ANNOUNCE] PeerAnnounce from \"{}\" ({}) v{}\x1b[0m", name, announce.node_id, announce.version);
+                                println!(
+                                    "\x1b[33m[ANNOUNCE] PeerAnnounce from \"{}\" ({}) v{}\x1b[0m",
+                                    name, announce.node_id, announce.version
+                                );
                                 let mut names = peer_names.write().unwrap();
                                 names.insert(announce.node_id.clone(), name.clone());
                             } else {
-                                println!("\x1b[33m[ANNOUNCE] PeerAnnounce from {} v{}\x1b[0m", announce.node_id, announce.version);
+                                println!(
+                                    "\x1b[33m[ANNOUNCE] PeerAnnounce from {} v{}\x1b[0m",
+                                    announce.node_id, announce.version
+                                );
                             }
                             if let Ok(node_id) = announce.node_id.parse() {
                                 save_peer_if_new(&peers_file, &node_id, &my_node_id);
@@ -1208,7 +1410,9 @@ fn spawn_receive_task(
                                     continue;
                                 }
                                 Err(e) => {
-                                    eprintln!("\x1b[35m[WARN] PeerEndorse bad signature: {e}\x1b[0m");
+                                    eprintln!(
+                                        "\x1b[35m[WARN] PeerEndorse bad signature: {e}\x1b[0m"
+                                    );
                                     continue;
                                 }
                             }
@@ -1219,7 +1423,9 @@ fn spawn_receive_task(
                             };
 
                             let sender_display = match &announce.friendly_name {
-                                Some(name) => format!("\"{}\" ({})", name, &sender[..8.min(sender.len())]),
+                                Some(name) => {
+                                    format!("\"{}\" ({})", name, &sender[..8.min(sender.len())])
+                                }
                                 None => sender[..8.min(sender.len())].to_string(),
                             };
 
@@ -1255,9 +1461,14 @@ fn spawn_receive_task(
                         }
                     } else {
                         // Fall back to GossipNotification
-                        match serde_json::from_slice::<notification::GossipNotification>(&msg.content) {
+                        match serde_json::from_slice::<notification::GossipNotification>(
+                            &msg.content,
+                        ) {
                             Ok(notif) => {
-                                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                                let now = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs();
                                 last_notification_time.store(now, Ordering::Relaxed);
                                 println!(
                                     "\x1b[36m[GOSSIP] [{} IRIs] sender={} medium={} reason={}\x1b[0m",
@@ -1271,7 +1482,10 @@ fn spawn_receive_task(
                                 }
                             }
                             Err(_) => {
-                                eprintln!("\x1b[35m[WARN] unknown message format ({} bytes)\x1b[0m", msg.content.len());
+                                eprintln!(
+                                    "\x1b[35m[WARN] unknown message format ({} bytes)\x1b[0m",
+                                    msg.content.len()
+                                );
                             }
                         }
                     }
@@ -1309,5 +1523,13 @@ fn spawn_receive_task(
             }
         }
         println!("\x1b[33m[RECV] Gossip receive task ended.\x1b[0m");
+        if receive_generation_counter.load(Ordering::Relaxed) == receive_generation {
+            eprintln!(
+                "\x1b[1;31m[RECONNECT] Active receive task exited — reconnecting gossip topic...\x1b[0m"
+            );
+            reconnect_failures.store(RECONNECT_AFTER_FAILURES, Ordering::Relaxed);
+            reconnect_requested.store(true, Ordering::Relaxed);
+            reconnect_notify.notify_one();
+        }
     });
 }

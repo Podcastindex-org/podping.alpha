@@ -107,10 +107,17 @@ impl GossipSender {
 
         self.api
             .call(act!(actor => async move {
-                    actor.gossip_sender
-                .join_peers(peers)
-                .await
-                .map_err(|e| anyhow::anyhow!(e))
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    actor.gossip_sender.join_peers(peers),
+                ).await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(anyhow::anyhow!(e)),
+                    Err(_) => {
+                        tracing::warn!("GossipSender: join_peers timed out inside actor");
+                        Err(anyhow::anyhow!("join_peers timed out"))
+                    }
+                }
             }))
             .await
     }
