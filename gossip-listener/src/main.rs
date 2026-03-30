@@ -29,6 +29,7 @@ const DEFAULT_TRUSTED_PUBLISHERS_FILE: &str = "trusted_publishers.txt";
 const DEFAULT_ARCHIVE_PATH: &str = "listener_archive.db";
 const DEFAULT_PEER_ENDORSE_INTERVAL: u64 = 45;
 const REBOOTSTRAP_TIMEOUT: u64 = 180;
+const REJOIN_INTERVAL_SECS: u64 = 1800; // Re-join peers every 30 minutes to prevent topology drift
 const RECONNECT_AFTER_FAILURES: u64 = 5;
 const BROADCAST_TIMEOUT_SECS: u64 = 10;
 const ARCHIVE_SYNC_ALPN: &[u8] = b"/podping-archive-sync/1";
@@ -826,6 +827,38 @@ async fn main() -> anyhow::Result<()> {
                     }
                 } else {
                     stall_count = 0;
+                }
+            }
+        });
+    }
+
+    // --- Periodic re-join: proactively re-join peers to prevent gossip topology drift ---
+    {
+        let rejoin_shared = shared_sender.clone();
+        let rejoin_peers_file = peers_file.clone();
+        let rejoin_bootstrap_str = bootstrap_peer_ids_str.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(REJOIN_INTERVAL_SECS)).await;
+
+                let mut peers: Vec<iroh::EndpointId> = rejoin_bootstrap_str
+                    .split(',')
+                    .filter(|s| !s.trim().is_empty())
+                    .filter_map(|s| s.trim().parse().ok())
+                    .collect();
+                let file_peers = load_known_peers(&rejoin_peers_file);
+                for p in file_peers {
+                    if !peers.contains(&p) {
+                        peers.push(p);
+                    }
+                }
+
+                if !peers.is_empty() {
+                    println!("\x1b[33m[REJOIN] Proactive re-join with {} peers to refresh gossip topology\x1b[0m", peers.len());
+                    let sender = rejoin_shared.read().await;
+                    if let Err(e) = sender.join_peers(peers, None).await {
+                        eprintln!("\x1b[35m[WARN] Periodic re-join failed: {}\x1b[0m", e);
+                    }
                 }
             }
         });
