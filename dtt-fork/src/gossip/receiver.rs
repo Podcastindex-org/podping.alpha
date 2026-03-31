@@ -112,13 +112,26 @@ impl Actor<anyhow::Error> for GossipReceiverActor {
                     action(self).await;
                 }
                 raw_event = self.gossip_receiver.next() => {
-                    if raw_event.is_none() {
-                        tracing::debug!("GossipReceiver: gossip stream ended, exiting actor loop");
-                        // Notify any pending waiters that the stream is done
-                        while let Some(waiter) = self.waiters.pop_back() {
-                            let _ = waiter.send(None);
+                    match &raw_event {
+                        None => {
+                            tracing::debug!("GossipReceiver: gossip stream ended, exiting actor loop");
+                            while let Some(waiter) = self.waiters.pop_back() {
+                                let _ = waiter.send(None);
+                            }
+                            break Ok(());
                         }
-                        break Ok(());
+                        Some(Err(e)) => {
+                            tracing::warn!("GossipReceiver: gossip stream error: {:?}, exiting actor loop", e);
+                            // Deliver the error to a waiter if one exists, then exit
+                            if let Some(waiter) = self.waiters.pop_back() {
+                                let _ = waiter.send(raw_event);
+                            }
+                            while let Some(waiter) = self.waiters.pop_back() {
+                                let _ = waiter.send(None);
+                            }
+                            break Ok(());
+                        }
+                        Some(Ok(_)) => {}
                     }
                     self.msg_queue.push_front(raw_event);
 

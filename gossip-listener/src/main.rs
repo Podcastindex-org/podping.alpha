@@ -1455,6 +1455,11 @@ fn spawn_receive_task(
 ) {
     tokio::spawn(async move {
         while let Some(event) = receiver.next().await {
+            // Stop processing if a newer receive task has been spawned (reconnect happened)
+            if receive_generation_counter.load(Ordering::Relaxed) != receive_generation {
+                println!("\x1b[33m[RECV] Stale receive task (gen {}) stopping, newer generation active.\x1b[0m", receive_generation);
+                return;
+            }
             match event {
                 Ok(event) => handle_event(
                     event,
