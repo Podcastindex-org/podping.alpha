@@ -490,6 +490,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         reconnect_notify.clone(),
         receive_generation.clone(),
         initial_receive_generation,
+        shutdown.clone(),
     );
 
     // --- Async broadcast task (with reconnection) ---
@@ -554,6 +555,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 bcast_reconnect_notify.clone(),
                                 reconnect_receive_generation.clone(),
                                 reconnect_receive_generation.fetch_add(1, Ordering::Relaxed) + 1,
+                                broadcast_shutdown.clone(),
                             );
 
                             consecutive_failures = 0;
@@ -647,6 +649,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     bcast_reconnect_notify.clone(),
                                     reconnect_receive_generation.clone(),
                                     reconnect_receive_generation.fetch_add(1, Ordering::Relaxed) + 1,
+                                    broadcast_shutdown.clone(),
                                 );
 
                                 // Drain retry queue through new sender
@@ -1407,6 +1410,7 @@ fn spawn_receive_task(
     reconnect_notify: Arc<Notify>,
     receive_generation_counter: Arc<AtomicU64>,
     receive_generation: u64,
+    shutdown: Arc<AtomicBool>,
 ) {
     tokio::spawn(async move {
         while let Some(event) = receiver.next().await {
@@ -1561,6 +1565,9 @@ fn spawn_receive_task(
             }
         }
         println!("\x1b[33m[RECV] Gossip receive task ended.\x1b[0m");
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
         if receive_generation_counter.load(Ordering::Relaxed) == receive_generation {
             eprintln!(
                 "\x1b[1;31m[RECONNECT] Active receive task exited — reconnecting gossip topic...\x1b[0m"
