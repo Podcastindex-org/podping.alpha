@@ -641,6 +641,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(tokio::sync::RwLock::new(gossip_sender));
     let broadcast_failures = Arc::new(AtomicU64::new(0));
     let notifications_received = Arc::new(AtomicU64::new(0));
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
     let reconnect_requested = Arc::new(AtomicBool::new(false));
     let reconnect_notify = Arc::new(Notify::new());
     let receive_generation = Arc::new(AtomicU64::new(0));
@@ -866,6 +867,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Reconnection monitor: watches for consecutive broadcast failures ---
     {
+        let reconnect_shutdown = shutdown_flag.clone();
         let reconnect_failures = broadcast_failures.clone();
         let reconnect_requested = reconnect_requested.clone();
         let reconnect_notify = reconnect_notify.clone();
@@ -891,6 +893,9 @@ async fn main() -> anyhow::Result<()> {
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
                     _ = reconnect_notify.notified() => {}
+                }
+                if reconnect_shutdown.load(Ordering::Relaxed) {
+                    break;
                 }
                 let failures = reconnect_failures.load(Ordering::Relaxed);
                 let requested = reconnect_requested.swap(false, Ordering::Relaxed);
@@ -951,6 +956,7 @@ async fn main() -> anyhow::Result<()> {
                                     reconnect_notify.clone(),
                                     reconnect_receive_generation.clone(),
                                     reconnect_receive_generation.fetch_add(1, Ordering::Relaxed) + 1,
+                                    reconnect_shutdown.clone(),
                                 );
 
                                 println!("\x1b[32m[RECONNECT] Gossip topic reconnected successfully.\x1b[0m");
@@ -1074,10 +1080,12 @@ async fn main() -> anyhow::Result<()> {
         reconnect_notify.clone(),
         receive_generation.clone(),
         initial_receive_generation,
+        shutdown_flag.clone(),
     );
 
     tokio::signal::ctrl_c().await?;
     println!("\n[info] shutting down...");
+    shutdown_flag.store(true, Ordering::Relaxed);
 
     endpoint.close().await;
     println!("[info] goodbye");
@@ -1452,6 +1460,7 @@ fn spawn_receive_task(
     reconnect_notify: Arc<Notify>,
     receive_generation_counter: Arc<AtomicU64>,
     receive_generation: u64,
+    shutdown: Arc<AtomicBool>,
 ) {
     tokio::spawn(async move {
         while let Some(event) = receiver.next().await {
@@ -1481,6 +1490,9 @@ fn spawn_receive_task(
             }
         }
         println!("\x1b[33m[RECV] Gossip receive task ended.\x1b[0m");
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
         if receive_generation_counter.load(Ordering::Relaxed) == receive_generation {
             eprintln!("\x1b[1;31m[RECONNECT] Active receive task exited — reconnecting gossip topic...\x1b[0m");
             reconnect_failures.store(RECONNECT_AFTER_FAILURES, Ordering::Relaxed);
