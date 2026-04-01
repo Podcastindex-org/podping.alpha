@@ -904,7 +904,16 @@ async fn main() -> anyhow::Result<()> {
                 let failures = reconnect_failures.load(Ordering::Relaxed);
                 let requested = reconnect_requested.swap(false, Ordering::Relaxed);
                 if failures >= RECONNECT_AFTER_FAILURES || requested {
+                    // Reset failures immediately to prevent re-entrant reconnects
+                    reconnect_failures.store(0, Ordering::Relaxed);
+
                     eprintln!("\x1b[1;31m[RECONNECT] {} consecutive broadcast failures — reconnecting gossip topic...\x1b[0m", failures);
+
+                    // Shut down the old Gossip actor so all its internal dtt actors stop
+                    {
+                        let old_gossip = reconnect_gossip_handle.read().await;
+                        let _ = old_gossip.shutdown().await;
+                    }
 
                     let dht_key = ed25519_dalek::SigningKey::from_bytes(&reconnect_node_key_bytes);
                     let dtt_topic = DttTopicId::new(TOPIC_STRING.to_string());
