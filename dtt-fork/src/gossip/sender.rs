@@ -12,6 +12,9 @@ use rand::seq::SliceRandom;
 #[derive(Debug, Clone)]
 pub struct GossipSender {
     api: Handle<GossipSenderActor, anyhow::Error>,
+    /// Direct handle to the iroh gossip sender, bypassing the actor queue.
+    /// Used for join_peers which doesn't need to be serialized with broadcasts.
+    direct_sender: iroh_gossip::api::GossipSender,
     _gossip: iroh_gossip::net::Gossip,
 }
 
@@ -28,6 +31,7 @@ impl GossipSender {
         gossip_sender: iroh_gossip::api::GossipSender,
         gossip: iroh_gossip::net::Gossip,
     ) -> Self {
+        let direct_sender = gossip_sender.clone();
         let (api, rx) = Handle::channel();
         tokio::spawn({
             let gossip = gossip.clone();
@@ -43,6 +47,7 @@ impl GossipSender {
 
         Self {
             api,
+            direct_sender,
             _gossip: gossip,
         }
     }
@@ -90,7 +95,33 @@ impl GossipSender {
             .await
     }
 
-    /// Join specific peer nodes.
+    /// Join specific peer nodes, bypassing the actor queue.
+    ///
+    /// This sends the join command directly to the iroh gossip actor without
+    /// going through the DttGossipSender actor. Use this for application-level
+    /// peer joining (re-join, watchdog) to avoid blocking broadcasts.
+    pub async fn join_peers_direct(&self, mut peers: Vec<EndpointId>, max_peers: Option<usize>) -> Result<()> {
+        if let Some(max_peers) = max_peers {
+            peers.shuffle(&mut rand::rng());
+            peers.truncate(max_peers);
+        }
+
+        tracing::debug!("GossipSender: joining {} peers (direct)", peers.len());
+
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.direct_sender.join_peers(peers),
+        ).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(anyhow::anyhow!(e)),
+            Err(_) => {
+                tracing::warn!("GossipSender: join_peers_direct timed out");
+                Err(anyhow::anyhow!("join_peers timed out"))
+            }
+        }
+    }
+
+    /// Join specific peer nodes via the actor queue.
     ///
     /// # Arguments
     ///

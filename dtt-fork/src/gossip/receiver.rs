@@ -133,6 +133,19 @@ impl Actor<anyhow::Error> for GossipReceiverActor {
                         }
                         Some(Ok(_)) => {}
                     }
+
+                    // If nobody is consuming events and the queue is growing,
+                    // the receive task is likely dead. Stop accumulating to prevent
+                    // a busy loop where the stream delivers events into a queue
+                    // nobody reads.
+                    if self.waiters.is_empty() && self.msg_queue.len() > 1000 {
+                        tracing::warn!(
+                            "GossipReceiver: msg_queue at {} with no waiters, exiting to prevent busy loop",
+                            self.msg_queue.len()
+                        );
+                        break Ok(());
+                    }
+
                     self.msg_queue.push_front(raw_event);
 
                     if let Some(waiter) = self.waiters.pop_back() {

@@ -18,7 +18,7 @@ use std::io::Write;
 use std::os::unix::io::FromRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::signal;
 use tokio::sync::{mpsc, Notify};
@@ -284,6 +284,8 @@ const RECONNECT_AFTER_FAILURES: u64 = 5;
 const BROADCAST_TIMEOUT_SECS: u64 = 10;
 const MAX_RETRY_QUEUE: usize = 500;
 const MAX_GOSSIP_PAYLOAD: usize = 60000; // Must stay under max_message_size (65536) with overhead
+const ISOLATION_CHECK_INTERVAL_SECS: u64 = 300; // Check for topology isolation every 5 minutes
+const ISOLATION_MIN_UNIQUE_PEERS: usize = 3;    // Minimum unique source peers to consider healthy
 
 // A pending IRI extracted from a ZMQ message, waiting to be batched
 struct PendingPing {
@@ -551,7 +553,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         println!("  Joining {} bootstrap peers...", bootstrap_peers.len());
         let sender = shared_sender.read().await;
-        if let Err(e) = sender.join_peers(bootstrap_peers, None).await {
+        if let Err(e) = sender.join_peers_direct(bootstrap_peers, None).await {
             eprintln!("  Warning: failed to join bootstrap peers: {}", e);
         }
     }
@@ -583,6 +585,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reconnect_count_counter = Arc::new(AtomicU64::new(0));
     let msgs_received_counter = Arc::new(AtomicU64::new(0));
     let neighbor_count = Arc::new(AtomicU32::new(0));
+    let unique_sources: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let start_instant = std::time::Instant::now();
 
     // Spawn the initial receive task
@@ -603,6 +606,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shutdown.clone(),
         msgs_received_counter.clone(),
         neighbor_count.clone(),
+        unique_sources.clone(),
     );
 
     // --- Async broadcast task (with reconnection) ---
@@ -619,6 +623,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bcast_msgs_received = msgs_received_counter.clone();
     let bcast_reconnect_counter = reconnect_count_counter.clone();
     let bcast_neighbor_count = neighbor_count.clone();
+    let bcast_unique_sources = unique_sources.clone();
     let reconnect_endpoint = endpoint.clone();
     let reconnect_node_key_bytes = node_key_bytes;
     let reconnect_dht_secret = dht_initial_secret.clone();
@@ -686,6 +691,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 broadcast_shutdown.clone(),
                                 bcast_msgs_received.clone(),
                                 bcast_neighbor_count.clone(),
+                                bcast_unique_sources.clone(),
                             );
 
                             // Reset neighbor count — fresh subscription starts with 0 neighbors
@@ -801,6 +807,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     broadcast_shutdown.clone(),
                                     bcast_msgs_received.clone(),
                                     bcast_neighbor_count.clone(),
+                                    bcast_unique_sources.clone(),
                                 );
 
                                 bcast_neighbor_count.store(0, Ordering::Relaxed);
@@ -985,7 +992,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             peers.len()
                         );
                         let sender = watchdog_shared.read().await;
-                        if let Err(e) = sender.join_peers(peers, None).await {
+                        if let Err(e) = sender.join_peers_direct(peers, None).await {
                             eprintln!("\x1b[35m[WARN] Re-bootstrap failed: {}\x1b[0m", e);
                         }
                     }
@@ -1028,7 +1035,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if !peers.is_empty() {
                     println!("\x1b[33m[REJOIN] Proactive re-join with {} peers to refresh gossip topology\x1b[0m", peers.len());
                     let sender = rejoin_shared.read().await;
-                    if let Err(e) = sender.join_peers(peers, None).await {
+                    if let Err(e) = sender.join_peers_direct(peers, None).await {
                         eprintln!("\x1b[35m[WARN] Periodic re-join failed: {}\x1b[0m", e);
                     }
                 }
@@ -1037,6 +1044,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // (receive task is spawned above via spawn_receive_task and re-spawned on reconnect)
+
+    // --- Isolation detection: trigger reconnect if too few unique source peers ---
+    {
+        let iso_unique_sources = unique_sources.clone();
+        let iso_sent = health_broadcasts_sent.clone();
+        let iso_failures = broadcast_failures.clone();
+        let iso_requested = reconnect_requested.clone();
+        let iso_notify = reconnect_notify.clone();
+        let iso_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            // Skip the first check to allow the swarm to stabilize after startup
+            tokio::time::sleep(std::time::Duration::from_secs(ISOLATION_CHECK_INTERVAL_SECS)).await;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(ISOLATION_CHECK_INTERVAL_SECS)).await;
+                if iso_shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let (peer_count, sent) = {
+                    let mut sources = iso_unique_sources.lock().unwrap();
+                    let count = sources.len();
+                    sources.clear();
+                    (count, iso_sent.load(Ordering::Relaxed))
+                };
+
+                if sent == 0 {
+                    // Writer hasn't sent anything yet, skip check
+                    continue;
+                }
+
+                if peer_count < ISOLATION_MIN_UNIQUE_PEERS {
+                    eprintln!(
+                        "\x1b[1;31m[ISOLATION] Only {} unique source peers in last {}s (min: {}). \
+                         Gossip topology may be isolated — triggering full reconnect.\x1b[0m",
+                        peer_count, ISOLATION_CHECK_INTERVAL_SECS, ISOLATION_MIN_UNIQUE_PEERS
+                    );
+                    iso_failures.store(RECONNECT_AFTER_FAILURES, Ordering::Relaxed);
+                    iso_requested.store(true, Ordering::Relaxed);
+                    iso_notify.notify_one();
+                } else {
+                    println!(
+                        "\x1b[90m[ISOLATION] Topology OK: {} unique source peers in last {}s\x1b[0m",
+                        peer_count, ISOLATION_CHECK_INTERVAL_SECS
+                    );
+                }
+            }
+        });
+    }
 
     // --- Periodic health report ---
     {
@@ -1584,6 +1639,7 @@ fn spawn_receive_task(
     shutdown: Arc<AtomicBool>,
     msgs_received: Arc<AtomicU64>,
     neighbor_count: Arc<AtomicU32>,
+    unique_sources: Arc<Mutex<HashSet<String>>>,
 ) {
     tokio::spawn(async move {
         let heartbeat_duration = std::time::Duration::from_secs(REBOOTSTRAP_TIMEOUT * 2);
@@ -1611,6 +1667,10 @@ fn spawn_receive_task(
                     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                     last_notification_time.store(now, Ordering::Relaxed);
                     msgs_received.fetch_add(1, Ordering::Relaxed);
+                    // Track unique source peers for isolation detection
+                    if let Ok(mut sources) = unique_sources.lock() {
+                        sources.insert(msg.delivered_from.to_string());
+                    }
                     // Try PeerAnnounce first
                     if let Ok(announce) = serde_json::from_slice::<PeerAnnounce>(&msg.content) {
                         if announce.msg_type == "peer_announce" {

@@ -30,6 +30,8 @@ const DEFAULT_ARCHIVE_PATH: &str = "listener_archive.db";
 const DEFAULT_PEER_ENDORSE_INTERVAL: u64 = 45;
 const REBOOTSTRAP_TIMEOUT: u64 = 180;
 const REJOIN_INTERVAL_SECS: u64 = 1800; // Re-join peers every 30 minutes to prevent topology drift
+const ISOLATION_CHECK_INTERVAL_SECS: u64 = 300; // Check for topology isolation every 5 minutes
+const ISOLATION_MIN_UNIQUE_PEERS: usize = 3;    // Minimum unique source peers to consider healthy
 const RECONNECT_AFTER_FAILURES: u64 = 5;
 const BROADCAST_TIMEOUT_SECS: u64 = 10;
 const ARCHIVE_SYNC_ALPN: &[u8] = b"/podping-archive-sync/1";
@@ -749,6 +751,7 @@ async fn main() -> anyhow::Result<()> {
     let notifications_received = Arc::new(AtomicU64::new(0));
     let reconnect_count = Arc::new(AtomicU64::new(0));
     let neighbor_count = Arc::new(AtomicU32::new(0));
+    let unique_sources: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let start_instant = std::time::Instant::now();
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let reconnect_requested = Arc::new(AtomicBool::new(false));
@@ -774,7 +777,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         println!("  Joining {} bootstrap peers...", bootstrap_peers.len());
         let sender = shared_sender.read().await;
-        if let Err(e) = sender.join_peers(bootstrap_peers, None).await {
+        if let Err(e) = sender.join_peers_direct(bootstrap_peers, None).await {
             eprintln!("  Warning: failed to join bootstrap peers: {}", e);
         }
     }
@@ -937,7 +940,7 @@ async fn main() -> anyhow::Result<()> {
                     } else {
                         println!("\x1b[33m[WATCHDOG] Re-joining {} peers...\x1b[0m", peers.len());
                         let sender = watchdog_shared.read().await;
-                        if let Err(e) = sender.join_peers(peers, None).await {
+                        if let Err(e) = sender.join_peers_direct(peers, None).await {
                             eprintln!("\x1b[35m[WARN] Re-bootstrap failed: {}\x1b[0m", e);
                         }
                     }
@@ -980,7 +983,7 @@ async fn main() -> anyhow::Result<()> {
                 if !peers.is_empty() {
                     println!("\x1b[33m[REJOIN] Proactive re-join with {} peers to refresh gossip topology\x1b[0m", peers.len());
                     let sender = rejoin_shared.read().await;
-                    if let Err(e) = sender.join_peers(peers, None).await {
+                    if let Err(e) = sender.join_peers_direct(peers, None).await {
                         eprintln!("\x1b[35m[WARN] Periodic re-join failed: {}\x1b[0m", e);
                     }
                 }
@@ -996,6 +999,7 @@ async fn main() -> anyhow::Result<()> {
         let reconnect_notify = reconnect_notify.clone();
         let reconnect_counter = reconnect_count.clone();
         let reconnect_neighbor_count = neighbor_count.clone();
+        let reconnect_unique_sources = unique_sources.clone();
         let reconnect_shared = shared_sender.clone();
         let reconnect_gossip_handle = shared_gossip.clone();
         let reconnect_endpoint = endpoint.clone();
@@ -1103,6 +1107,7 @@ async fn main() -> anyhow::Result<()> {
                                     reconnect_receive_generation.fetch_add(1, Ordering::Relaxed) + 1,
                                     reconnect_shutdown.clone(),
                                     reconnect_neighbor_count.clone(),
+                                    reconnect_unique_sources.clone(),
                                 );
 
                                 // Reset neighbor count — fresh subscription starts with 0 neighbors
@@ -1121,6 +1126,54 @@ async fn main() -> anyhow::Result<()> {
                             reconnect_failures.store(0, Ordering::Relaxed);
                         }
                     }
+                }
+            }
+        });
+    }
+
+    // --- Isolation detection: trigger reconnect if too few unique source peers ---
+    {
+        let iso_unique_sources = unique_sources.clone();
+        let iso_notifs = notifications_received.clone();
+        let iso_failures = broadcast_failures.clone();
+        let iso_requested = reconnect_requested.clone();
+        let iso_notify = reconnect_notify.clone();
+        let iso_shutdown = shutdown_flag.clone();
+        tokio::spawn(async move {
+            // Skip the first check to allow the swarm to stabilize after startup
+            tokio::time::sleep(std::time::Duration::from_secs(ISOLATION_CHECK_INTERVAL_SECS)).await;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(ISOLATION_CHECK_INTERVAL_SECS)).await;
+                if iso_shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let (peer_count, notifs) = {
+                    let mut sources = iso_unique_sources.lock().unwrap();
+                    let count = sources.len();
+                    sources.clear();
+                    (count, iso_notifs.load(Ordering::Relaxed))
+                };
+
+                if notifs == 0 {
+                    // Haven't received any notifications yet, skip check
+                    continue;
+                }
+
+                if peer_count < ISOLATION_MIN_UNIQUE_PEERS {
+                    eprintln!(
+                        "\x1b[1;31m[ISOLATION] Only {} unique source peers in last {}s (min: {}). \
+                         Gossip topology may be isolated — triggering full reconnect.\x1b[0m",
+                        peer_count, ISOLATION_CHECK_INTERVAL_SECS, ISOLATION_MIN_UNIQUE_PEERS
+                    );
+                    iso_failures.store(RECONNECT_AFTER_FAILURES, Ordering::Relaxed);
+                    iso_requested.store(true, Ordering::Relaxed);
+                    iso_notify.notify_one();
+                } else {
+                    println!(
+                        "\x1b[90m[ISOLATION] Topology OK: {} unique source peers in last {}s\x1b[0m",
+                        peer_count, ISOLATION_CHECK_INTERVAL_SECS
+                    );
                 }
             }
         });
@@ -1232,6 +1285,7 @@ async fn main() -> anyhow::Result<()> {
         initial_receive_generation,
         shutdown_flag.clone(),
         neighbor_count.clone(),
+        unique_sources.clone(),
     );
 
     tokio::signal::ctrl_c().await?;
@@ -1633,6 +1687,7 @@ fn spawn_receive_task(
     receive_generation: u64,
     shutdown: Arc<AtomicBool>,
     neighbor_count: Arc<AtomicU32>,
+    unique_sources: Arc<Mutex<HashSet<String>>>,
 ) {
     tokio::spawn(async move {
         let heartbeat_duration = std::time::Duration::from_secs(REBOOTSTRAP_TIMEOUT * 2);
@@ -1659,6 +1714,11 @@ fn spawn_receive_task(
                     match ev {
                         iroh_gossip::api::Event::NeighborUp(_) => { neighbor_count.fetch_add(1, Ordering::Relaxed); }
                         iroh_gossip::api::Event::NeighborDown(_) => { neighbor_count.fetch_sub(1, Ordering::Relaxed); }
+                        iroh_gossip::api::Event::Received(msg) => {
+                            if let Ok(mut sources) = unique_sources.lock() {
+                                sources.insert(msg.delivered_from.to_string());
+                            }
+                        }
                         _ => {}
                     }
                 }
