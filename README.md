@@ -1,12 +1,48 @@
 # Podping.alpha
 
-(*** This documentation is incomplete ***)
+( **This documentation is incomplete** )
 
 Podping.cloud is the hosted front-end to the [Podping](https://github.com/Podcastindex-org/podping) notification 
 system.  It stands in front of the back-end writer(s) to provide a more friendly HTTP based API.
 
 This alpha version is a work in progress.  It is currently in an exploration phase.  The goal of this
 version is to wireframe the p2p gossip writer and corresponding front-end support.
+
+## Testing
+At this point on the development just launching the `gossip-listener` will help with the testing.
+
+Setting `ARCHIVE_ENABLED` to `1`, `yes` or `true` could be a second step, but this could fill up your hard disk.
+
+### Set-up
+```shell
+git clone https://github.com/Podcastindex-org/podping.alpha.git && cd "$(basename "$_" .git)"
+cd gossip-listener
+cargo build
+NODE_FRIENDLY_NAME='IDENTIFICADOR_AMIGABLE' cargo run
+```
+
+#### Dependencies
+You need `rust` in order to run/compile this tool.
+- In [ArchLinux](https://wiki.archlinux.org/title/Rust) you can just install `rust` or `rustup` (recommended if you intend to do development) with : `pacman -S rust`
+
+### Configuration
+* You can change these ENV variables:
+  * `ZMQ_BIND_ADDR`
+  * `IROH_SECRET_FILE`
+  * `IROH_NODE_KEY_FILE`
+  * `ARCHIVE_PATH`
+  * `KNOWN_PEERS_FILE`
+  * `BOOTSTRAP_PEER_IDS`
+  * `PEER_ANNOUNCE_INTERVAL`
+  * `DHT_INITIAL_SECRET`
+  * `TRUSTED_PUBLISHERS_FILE`
+  * `PEER_ENDORSE_INTERVAL`
+  * `AUTO_TRUST_ENDORSEMENTS`
+  * `ARCHIVE_ENABLED`
+  * `NODE_FRIENDLY_NAME` to advertise a more friendly id.
+
+### Known Issues
+* `gossip-listener` uses the port `6881` so you might get a warning if ussing a Bitorrent tracker like ktorrent. You can use the Bitorrent client anyway, but it's not recommended to have both programs running on the same machine while testing.
 
 <br>
 
