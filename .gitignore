@@ -36,3 +36,4 @@ gossip_listener_known_peers.txt
 
 gossip-writer/data/*
 result
+artifacts/
