@@ -1301,7 +1301,21 @@ async fn main() -> anyhow::Result<()> {
     println!("\n[info] shutting down...");
     shutdown_flag.store(true, Ordering::Relaxed);
 
-    endpoint.close().await;
+    // Hard shutdown timeout — if endpoint.close() hangs (e.g., relay keeps
+    // receiving packets from peers), force exit after 5 seconds.
+    let shutdown_deadline = tokio::time::sleep(std::time::Duration::from_secs(5));
+    tokio::pin!(shutdown_deadline);
+
+    tokio::select! {
+        _ = endpoint.close() => {
+            println!("[info] Clean shutdown complete.");
+        }
+        _ = &mut shutdown_deadline => {
+            eprintln!("\x1b[33m[SHUTDOWN] Graceful shutdown timed out after 5s, forcing exit.\x1b[0m");
+            std::process::exit(0);
+        }
+    }
+
     println!("[info] goodbye");
     Ok(())
 }
