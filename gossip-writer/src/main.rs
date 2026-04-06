@@ -78,11 +78,14 @@ struct PeerAnnounce {
     os: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     build_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    neighbors: Option<Vec<String>>,
 }
 
 #[derive(Default, Clone)]
 struct AnnounceMetrics {
     neighbor_count: Option<u32>,
+    neighbors: Option<Vec<String>>,
     uptime_secs: Option<u64>,
     msgs_received: Option<u64>,
     msgs_sent: Option<u64>,
@@ -131,6 +134,7 @@ impl PeerAnnounce {
             reconnect_count: metrics.reconnect_count,
             os: Some(std::env::consts::OS.to_string()),
             build_type: Some(if cfg!(debug_assertions) { "debug" } else { "release" }.to_string()),
+            neighbors: metrics.neighbors,
         }
     }
 
@@ -165,6 +169,7 @@ impl PeerAnnounce {
             reconnect_count: None,
             os: None,
             build_type: None,
+            neighbors: None,
         }
     }
 
@@ -585,6 +590,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reconnect_count_counter = Arc::new(AtomicU64::new(0));
     let msgs_received_counter = Arc::new(AtomicU64::new(0));
     let neighbor_count = Arc::new(AtomicU32::new(0));
+    let neighbor_ids: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
     let unique_sources: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let seq_counter = Arc::new(AtomicU64::new(1));
     let start_instant = std::time::Instant::now();
@@ -607,6 +613,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shutdown.clone(),
         msgs_received_counter.clone(),
         neighbor_count.clone(),
+        neighbor_ids.clone(),
         unique_sources.clone(),
     );
 
@@ -624,6 +631,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bcast_msgs_received = msgs_received_counter.clone();
     let bcast_reconnect_counter = reconnect_count_counter.clone();
     let bcast_neighbor_count = neighbor_count.clone();
+    let bcast_neighbor_ids = neighbor_ids.clone();
     let bcast_unique_sources = unique_sources.clone();
     let reconnect_endpoint = endpoint.clone();
     let reconnect_node_key_bytes = node_key_bytes;
@@ -692,10 +700,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 broadcast_shutdown.clone(),
                                 bcast_msgs_received.clone(),
                                 bcast_neighbor_count.clone(),
+                                bcast_neighbor_ids.clone(),
                                 bcast_unique_sources.clone(),
                             );
 
-                            // Reset neighbor count — fresh subscription starts with 0 neighbors
+                            // Reset neighbor tracking — fresh subscription
+                            bcast_neighbor_ids.write().unwrap().clear();
+                            // Reset neighbor count
                             bcast_neighbor_count.store(0, Ordering::Relaxed);
                             consecutive_failures = 0;
                             bcast_failure_count.store(0, Ordering::Relaxed);
@@ -808,9 +819,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     broadcast_shutdown.clone(),
                                     bcast_msgs_received.clone(),
                                     bcast_neighbor_count.clone(),
+                                    bcast_neighbor_ids.clone(),
                                     bcast_unique_sources.clone(),
                                 );
 
+                                bcast_neighbor_ids.write().unwrap().clear();
                                 bcast_neighbor_count.store(0, Ordering::Relaxed);
 
                                 // Drain retry queue through new sender
@@ -866,6 +879,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let announce_last_notif = last_notification_time.clone();
         let announce_reconnects = reconnect_count_counter.clone();
         let announce_neighbors = neighbor_count.clone();
+        let announce_neighbor_ids = neighbor_ids.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(peer_announce_interval)).await;
@@ -873,6 +887,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let last_notif = announce_last_notif.load(Ordering::Relaxed);
                 let metrics = AnnounceMetrics {
                     neighbor_count: Some(announce_neighbors.load(Ordering::Relaxed)),
+                    neighbors: Some(announce_neighbor_ids.read().unwrap().iter().cloned().collect()),
                     uptime_secs: Some(start_instant.elapsed().as_secs()),
                     msgs_received: Some(announce_recv.load(Ordering::Relaxed)),
                     msgs_sent: Some(announce_sent.load(Ordering::Relaxed)),
@@ -1648,6 +1663,7 @@ fn spawn_receive_task(
     shutdown: Arc<AtomicBool>,
     msgs_received: Arc<AtomicU64>,
     neighbor_count: Arc<AtomicU32>,
+    neighbor_ids: Arc<RwLock<HashSet<String>>>,
     unique_sources: Arc<Mutex<HashSet<String>>>,
 ) {
     tokio::spawn(async move {
@@ -1808,6 +1824,7 @@ fn spawn_receive_task(
                 }
                 Ok(Event::NeighborUp(node_id)) => {
                     neighbor_count.fetch_add(1, Ordering::Relaxed);
+                    neighbor_ids.write().unwrap().insert(node_id.to_string());
                     let node_str = node_id.to_string();
                     let display = {
                         let names = peer_names.read().unwrap();
@@ -1821,6 +1838,7 @@ fn spawn_receive_task(
                 }
                 Ok(Event::NeighborDown(node_id)) => {
                     neighbor_count.fetch_sub(1, Ordering::Relaxed);
+                    neighbor_ids.write().unwrap().remove(&node_id.to_string());
                     let node_str = node_id.to_string();
                     let display = {
                         let names = peer_names.read().unwrap();
