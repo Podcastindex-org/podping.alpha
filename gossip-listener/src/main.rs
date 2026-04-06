@@ -81,12 +81,15 @@ struct PeerAnnounce {
     os: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     build_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    neighbors: Option<Vec<String>>,
 }
 
 /// Runtime counters passed to PeerAnnounce for health reporting.
 #[derive(Default, Clone)]
 struct AnnounceMetrics {
     neighbor_count: Option<u32>,
+    neighbors: Option<Vec<String>>,
     uptime_secs: Option<u64>,
     msgs_received: Option<u64>,
     msgs_sent: Option<u64>,
@@ -135,6 +138,7 @@ impl PeerAnnounce {
             reconnect_count: metrics.reconnect_count,
             os: Some(std::env::consts::OS.to_string()),
             build_type: Some(if cfg!(debug_assertions) { "debug" } else { "release" }.to_string()),
+            neighbors: metrics.neighbors,
         }
     }
 
@@ -163,6 +167,7 @@ impl PeerAnnounce {
             reconnect_count: None,
             os: None,
             build_type: None,
+            neighbors: None,
         }
     }
 
@@ -756,6 +761,7 @@ async fn main() -> anyhow::Result<()> {
     let notifications_received = Arc::new(AtomicU64::new(0));
     let reconnect_count = Arc::new(AtomicU64::new(0));
     let neighbor_count = Arc::new(AtomicU32::new(0));
+    let neighbor_ids: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
     let unique_sources: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let last_seq_per_sender: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
     let start_instant = std::time::Instant::now();
@@ -809,6 +815,7 @@ async fn main() -> anyhow::Result<()> {
         let announce_last_notif = last_notification_time.clone();
         let announce_reconnects = reconnect_count.clone();
         let announce_neighbors = neighbor_count.clone();
+        let announce_neighbor_ids = neighbor_ids.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(peer_announce_interval)).await;
@@ -816,6 +823,7 @@ async fn main() -> anyhow::Result<()> {
                 let last_notif = announce_last_notif.load(Ordering::Relaxed);
                 let metrics = AnnounceMetrics {
                     neighbor_count: Some(announce_neighbors.load(Ordering::Relaxed)),
+                    neighbors: Some(announce_neighbor_ids.read().unwrap().iter().cloned().collect()),
                     uptime_secs: Some(start_instant.elapsed().as_secs()),
                     msgs_received: Some(announce_notifs.load(Ordering::Relaxed)),
                     msgs_sent: None,
@@ -1005,6 +1013,7 @@ async fn main() -> anyhow::Result<()> {
         let reconnect_notify = reconnect_notify.clone();
         let reconnect_counter = reconnect_count.clone();
         let reconnect_neighbor_count = neighbor_count.clone();
+        let reconnect_neighbor_ids = neighbor_ids.clone();
         let reconnect_unique_sources = unique_sources.clone();
         let reconnect_last_seq = last_seq_per_sender.clone();
         let reconnect_shared = shared_sender.clone();
@@ -1114,11 +1123,14 @@ async fn main() -> anyhow::Result<()> {
                                     reconnect_receive_generation.fetch_add(1, Ordering::Relaxed) + 1,
                                     reconnect_shutdown.clone(),
                                     reconnect_neighbor_count.clone(),
+                                    reconnect_neighbor_ids.clone(),
                                     reconnect_unique_sources.clone(),
                                     reconnect_last_seq.clone(),
                                 );
 
-                                // Reset neighbor count — fresh subscription starts with 0 neighbors
+                                // Reset neighbor tracking — fresh subscription starts with 0 neighbors
+                                reconnect_neighbor_ids.write().unwrap().clear();
+                                // Reset neighbor count
                                 reconnect_neighbor_count.store(0, Ordering::Relaxed);
                                 last_reconnect = std::time::Instant::now();
                                 reconnect_counter.fetch_add(1, Ordering::Relaxed);
@@ -1293,6 +1305,7 @@ async fn main() -> anyhow::Result<()> {
         initial_receive_generation,
         shutdown_flag.clone(),
         neighbor_count.clone(),
+        neighbor_ids.clone(),
         unique_sources.clone(),
         last_seq_per_sender.clone(),
     );
@@ -1727,6 +1740,7 @@ fn spawn_receive_task(
     receive_generation: u64,
     shutdown: Arc<AtomicBool>,
     neighbor_count: Arc<AtomicU32>,
+    neighbor_ids: Arc<RwLock<HashSet<String>>>,
     unique_sources: Arc<Mutex<HashSet<String>>>,
     last_seq_per_sender: Arc<Mutex<HashMap<String, u64>>>,
 ) {
@@ -1753,8 +1767,14 @@ fn spawn_receive_task(
             match event {
                 Ok(ref ev) => {
                     match ev {
-                        iroh_gossip::api::Event::NeighborUp(_) => { neighbor_count.fetch_add(1, Ordering::Relaxed); }
-                        iroh_gossip::api::Event::NeighborDown(_) => { neighbor_count.fetch_sub(1, Ordering::Relaxed); }
+                        iroh_gossip::api::Event::NeighborUp(id) => {
+                            neighbor_count.fetch_add(1, Ordering::Relaxed);
+                            neighbor_ids.write().unwrap().insert(id.to_string());
+                        }
+                        iroh_gossip::api::Event::NeighborDown(id) => {
+                            neighbor_count.fetch_sub(1, Ordering::Relaxed);
+                            neighbor_ids.write().unwrap().remove(&id.to_string());
+                        }
                         iroh_gossip::api::Event::Received(msg) => {
                             if let Ok(mut sources) = unique_sources.lock() {
                                 sources.insert(msg.delivered_from.to_string());
