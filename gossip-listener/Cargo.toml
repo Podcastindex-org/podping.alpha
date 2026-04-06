@@ -1,6 +1,6 @@
 [package]
 name = "gossip-listener"
-version = "0.4.8"
+version = "0.4.9"
 authors = ["Dave Jones"]
 edition = "2021"
 
@@ -22,6 +22,7 @@ blake3 = "1"
 axum = "0.8"
 tokio-stream = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 libc = "0.2"
 
 [patch.crates-io]

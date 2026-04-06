@@ -542,8 +542,8 @@ async fn run_catchup(
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Write tracing output to fd 3 only if TRACE_FD3=1 and fd 3 is a pipe or
-    // regular file, otherwise stderr. This avoids inherited sockets or other
-    // incompatible fds that reject write() with EINVAL.
+    // regular file, otherwise stderr. Uses a non-blocking writer so log spam
+    // (e.g., iroh path exhaustion retries) can't starve the tokio runtime.
     // Usage: TRACE_FD3=1 RUST_LOG=debug ./gossip-listener 3>trace.log
     let trace_writer: Box<dyn std::io::Write + Send + Sync> = unsafe {
         let mut stat: libc::stat = std::mem::zeroed();
@@ -559,10 +559,10 @@ async fn main() -> anyhow::Result<()> {
             Box::new(std::io::stderr())
         }
     };
-    let trace_writer = std::sync::Mutex::new(trace_writer);
+    let (non_blocking, _guard) = tracing_appender::non_blocking(trace_writer);
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(trace_writer)
+        .with_writer(non_blocking)
         .init();
 
     // WORKAROUND: iroh-quinn 0.16.1 panic resilience

@@ -1294,7 +1294,7 @@ dependencies = [
 
 [[package]]
 name = "gossip-writer"
-version = "0.4.8"
+version = "0.4.9"
 dependencies = [
  "blake3",
  "bytes",
@@ -1313,6 +1313,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tokio",
+ "tracing-appender",
  "tracing-subscriber",
  "zmq",
 ]
@@ -3910,6 +3911,18 @@ dependencies = [
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
+]
+
+[[package]]
+name = "tracing-appender"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "786d480bce6247ab75f005b14ae1624ad978d3029d9113f0a22fa1ac773faeaf"
+dependencies = [
+ "crossbeam-channel",
+ "thiserror",
+ "time",
+ "tracing-subscriber",
 ]
 
 [[package]]
