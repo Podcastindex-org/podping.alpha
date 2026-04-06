@@ -1,5 +1,5 @@
 {
-  description = "Podping.alpha - gossip-listener and gossip-writer";
+  description = "Podping.alpha - gossip-listener";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -72,32 +72,7 @@
             ];
         };
 
-        gossipWriterCommonArgs = {
-          src = workspaceSrc;
-          strictDeps = true;
-
-          cargoToml = ./gossip-writer/Cargo.toml;
-          cargoLock = ./gossip-writer/Cargo.lock;
-
-          postUnpack = ''
-            export sourceRoot=$sourceRoot/gossip-writer
-          '';
-
-          cargoExtraArgs = "--offline";
-
-          nativeBuildInputs = with pkgs; [
-            pkg-config
-          ];
-
-          buildInputs = with pkgs; [
-            openssl
-            zeromq
-            capnproto
-          ];
-        };
-
         gossipListenerCargoArtifacts = craneLib.buildDepsOnly gossipListenerCommonArgs;
-        gossipWriterCargoArtifacts = craneLib.buildDepsOnly gossipWriterCommonArgs;
 
         gossipListener = craneLib.buildPackage (
           gossipListenerCommonArgs
@@ -106,17 +81,10 @@
           }
         );
 
-        gossipWriter = craneLib.buildPackage (
-          gossipWriterCommonArgs
-          // {
-            cargoArtifacts = gossipWriterCargoArtifacts;
-          }
-        );
       in
       {
         packages = {
           gossip-listener = gossipListener;
-          gossip-writer = gossipWriter;
           default = gossipListener;
         };
 
@@ -129,17 +97,10 @@
             drv = gossipListener;
             name = "gossip-listener";
           };
-          gossip-writer = flake-utils.lib.mkApp {
-            drv = gossipWriter;
-            name = "gossip-writer";
-          };
         };
 
         devShells.default = craneLib.devShell {
-          inputsFrom = [
-            gossipListener
-            gossipWriter
-          ];
+          inputsFrom = [ gossipListener ];
 
           packages = with pkgs; [
             cargo-watch
