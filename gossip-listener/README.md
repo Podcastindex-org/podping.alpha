@@ -37,25 +37,25 @@ cargo build --release --manifest-path gossip-listener/Cargo.toml
 ### With prebuilt binaries (GitHub Releases)
 
 When you tag a release (e.g., `v1.2.3`), the GitHub Action publishes binaries
-for Linux, macOS, and Windows under the release assets.
+for Linux, macOS, and ~Windows~  under the release assets.
 
 Download and verify:
-
 ```sh
-VERSION="v1.2.3"
-OS=linux # linux | macos | windows
-ARCH=x86_64 # x86_64 | aarch64
-URL="https://github.com/<owner>/<repo>/releases/download/${VERSION}/gossip-listener-${VERSION}-${OS}-${ARCH}.tar.gz"
+VERSION="v0.5.1"
+OS=$(uname -s) # linux | macos
+[ "${OS,,}" = darwin ] && OS="macos" 
+ARCH=x86_64 # x86_64 | aarch64 | armv7
+BINARY="gossip-listener-${VERSION}-${OS,,}-${ARCH}.tar.gz"
+URL="https://github.com/Podcastindex-org/podping.alpha/releases/download/${VERSION}/${BINARY}"
 SHA_URL="${URL}.sha256"
-curl -L "$URL" -o gossip-listener.tar.gz
-curl -L "$SHA_URL" -o gossip-listener.tar.gz.sha256
-shasum -a 256 -c gossip-listener.tar.gz.sha256
-tar -xzf gossip-listener.tar.gz
+curl -L "$URL" -O
+curl -L "$SHA_URL" -O
+shasum -a 256 -c ${BINARY}.sha256 && tar -xzf ${BINARY}
+export NODE_FRIENDLY_NAME='SOMETHING_FANCY'
 ./gossip-listener
 ```
 
 Windows (PowerShell):
-
 ```powershell
 $Version = "v1.2.3"
 $Url = "https://github.com/<owner>/<repo>/releases/download/$Version/gossip-listener-$Version-windows-x86_64.zip"
