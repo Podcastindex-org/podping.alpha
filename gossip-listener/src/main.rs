@@ -616,9 +616,14 @@ fn print_help(bin_name: &str) {
 
 fn handle_cli_flags() -> bool {
     let mut args = env::args();
-    let bin_name = args
+    let bin_name_raw = args
         .next()
         .unwrap_or_else(|| "gossip-listener".to_string());
+    let bin_name = Path::new(&bin_name_raw)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("gossip-listener")
+        .to_string();
 
     let mut show_help = false;
     let mut show_version = false;
