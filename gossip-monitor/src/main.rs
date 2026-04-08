@@ -767,22 +767,25 @@ fn spawn_receive_task(
     registry: Arc<PeerRegistry>,
 ) {
     tokio::spawn(async move {
-        let heartbeat_duration = std::time::Duration::from_secs(REBOOTSTRAP_TIMEOUT * 2);
         let my_node_id_str = my_node_id.to_string();
         loop {
-            let event = tokio::select! {
-                event = receiver.next() => {
-                    match event {
-                        Some(event) => event,
-                        None => break,
+            let event = match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                receiver.next(),
+            ).await {
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(_) => {
+                    let last = last_notification_time.load(Ordering::Relaxed);
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                    if now.saturating_sub(last) > REBOOTSTRAP_TIMEOUT * 2 {
+                        eprintln!(
+                            "[RECV] No gossip messages received for {}s — triggering reconnect",
+                            now.saturating_sub(last)
+                        );
+                        break;
                     }
-                }
-                _ = tokio::time::sleep(heartbeat_duration) => {
-                    eprintln!(
-                        "[RECV] No gossip events for {}s — gossip layer may be dead, triggering reconnect",
-                        REBOOTSTRAP_TIMEOUT * 2
-                    );
-                    break;
+                    continue;
                 }
             };
             // Stop processing if a newer receive task has been spawned (reconnect happened)
