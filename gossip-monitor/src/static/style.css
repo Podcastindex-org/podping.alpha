@@ -1,0 +1,144 @@
+/* Podping Gossip Monitor - Dark Theme */
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    background: #1a1a2e;
+    color: #e0e0e0;
+    min-height: 100vh;
+}
+
+header {
+    background: #16213e;
+    padding: 1rem 2rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 1rem;
+    border-bottom: 2px solid #e94560;
+}
+
+header h1 {
+    font-size: 1.4rem;
+    color: #e94560;
+}
+
+#summary {
+    display: flex;
+    gap: 1.5rem;
+    font-size: 0.95rem;
+}
+
+#summary strong {
+    color: #e94560;
+}
+
+main {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 1rem;
+    padding: 1rem;
+    max-width: 1600px;
+    margin: 0 auto;
+}
+
+@media (min-width: 1200px) {
+    main {
+        grid-template-columns: 1fr 1fr;
+    }
+}
+
+section {
+    background: #16213e;
+    border-radius: 8px;
+    padding: 1rem;
+}
+
+section h2 {
+    font-size: 1rem;
+    color: #e94560;
+    margin-bottom: 0.75rem;
+}
+
+/* ---- Topology Graph ---- */
+
+#topology {
+    width: 100%;
+    min-height: 400px;
+    display: block;
+}
+
+.edge {
+    stroke: #334;
+    stroke-width: 1.5;
+}
+
+.node {
+    fill: #0f3460;
+    stroke: #e94560;
+    stroke-width: 2;
+    cursor: grab;
+}
+
+.node:active {
+    cursor: grabbing;
+}
+
+.stale-node {
+    fill: #555;
+    stroke: #888;
+    opacity: 0.5;
+}
+
+.label {
+    fill: #ccc;
+    font-size: 11px;
+    pointer-events: none;
+    user-select: none;
+}
+
+/* ---- Peer Table ---- */
+
+.table-wrap {
+    overflow-x: auto;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+}
+
+thead th {
+    background: #0f3460;
+    color: #e94560;
+    padding: 0.4rem 0.6rem;
+    text-align: left;
+    white-space: nowrap;
+    position: sticky;
+    top: 0;
+}
+
+tbody td {
+    padding: 0.35rem 0.6rem;
+    border-bottom: 1px solid #1a1a2e;
+    white-space: nowrap;
+}
+
+tbody tr:hover {
+    background: rgba(233, 69, 96, 0.1);
+}
+
+tbody tr.stale {
+    opacity: 0.4;
+}
+
+tbody tr.stale td {
+    color: #888;
+}

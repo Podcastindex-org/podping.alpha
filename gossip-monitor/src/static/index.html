@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Podping Gossip Monitor</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+</head>
+<body>
+    <header>
+        <h1>Podping Gossip Monitor</h1>
+        <div id="summary">
+            <span>Total: <strong id="stat-total">0</strong></span>
+            <span>Active: <strong id="stat-active">0</strong></span>
+            <span>Stale: <strong id="stat-stale">0</strong></span>
+            <span>Edges: <strong id="stat-edges">0</strong></span>
+        </div>
+    </header>
+
+    <main>
+        <section id="graph-section">
+            <h2>Topology</h2>
+            <svg id="topology"></svg>
+        </section>
+
+        <section id="table-section">
+            <h2>Peers</h2>
+            <div class="table-wrap">
+                <table id="peer-table">
+                    <thead>
+                        <tr>
+                            <th>Name</th>
+                            <th>Version</th>
+                            <th>CPU</th>
+                            <th>Mem</th>
+                            <th>Thr</th>
+                            <th>Nbr</th>
+                            <th>Uptime</th>
+                            <th>Rx</th>
+                            <th>Tx</th>
+                            <th>Age</th>
+                            <th>Reconn</th>
+                            <th>OS</th>
+                        </tr>
+                    </thead>
+                    <tbody id="peer-tbody"></tbody>
+                </table>
+            </div>
+        </section>
+    </main>
+
+    <script src="/js/monitor.js"></script>
+</body>
+</html>
