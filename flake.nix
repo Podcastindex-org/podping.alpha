@@ -19,7 +19,7 @@
       flake-utils,
       rust-overlay,
     }:
-    flake-utils.lib.eachDefaultSystem (
+    flake-utils.lib.eachSystem [ "x86_64-linux" ] (
       system:
       let
         pkgs = import nixpkgs {
@@ -41,7 +41,7 @@
           filter = cargoOrMarkdown;
         };
 
-        commonArgs = {
+        gossipListenerCommonArgs = {
           src = workspaceSrc;
           strictDeps = true;
 
@@ -72,14 +72,15 @@
             ];
         };
 
-        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+        gossipListenerCargoArtifacts = craneLib.buildDepsOnly gossipListenerCommonArgs;
 
         gossipListener = craneLib.buildPackage (
-          commonArgs
+          gossipListenerCommonArgs
           // {
-            inherit cargoArtifacts;
+            cargoArtifacts = gossipListenerCargoArtifacts;
           }
         );
+
       in
       {
         packages = {
@@ -87,9 +88,15 @@
           default = gossipListener;
         };
 
-        apps.default = flake-utils.lib.mkApp {
-          drv = gossipListener;
-          name = "gossip-listener";
+        apps = {
+          default = flake-utils.lib.mkApp {
+            drv = gossipListener;
+            name = "gossip-listener";
+          };
+          gossip-listener = flake-utils.lib.mkApp {
+            drv = gossipListener;
+            name = "gossip-listener";
+          };
         };
 
         devShells.default = craneLib.devShell {
