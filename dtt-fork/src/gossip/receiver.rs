@@ -164,6 +164,10 @@ impl Actor<anyhow::Error> for GossipReceiverActor {
                                 hash.update(msg.content.clone());
                                 if let Ok(lmh) = hash.finalize()[..32].try_into() {
                                     self.last_message_hashes.push(lmh);
+                                    // Keep only the most recent 5 hashes for DHT record publishing
+                                    if self.last_message_hashes.len() > 5 {
+                                        self.last_message_hashes.remove(0);
+                                    }
                                 }
                             }
                             iroh_gossip::api::Event::NeighborUp(node_id) => {

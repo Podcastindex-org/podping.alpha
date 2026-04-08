@@ -81,24 +81,32 @@ impl PublisherActor {
             .filter_map(|pub_key| TryInto::<[u8; 32]>::try_into(pub_key.as_slice()).ok())
             .collect::<Vec<_>>();
 
-        let last_message_hashes = self
+        let raw_hashes = self
             .gossip_receiver
             .last_message_hashes()
-            .await
-            .iter()
-            .filter_map(|hash| TryInto::<[u8; 32]>::try_into(hash.as_slice()).ok())
-            .collect::<Vec<_>>();
+            .await;
+        // Pad to exactly 5 entries (GossipRecordContent requires [[u8; 32]; 5])
+        let mut last_message_hashes = [[0u8; 32]; 5];
+        for (i, hash) in raw_hashes.iter().take(5).enumerate() {
+            last_message_hashes[i] = *hash;
+        }
+
+        // Pad active_peers to exactly 5 entries
+        let mut padded_peers = [[0u8; 32]; 5];
+        for (i, peer) in active_peers.iter().take(5).enumerate() {
+            padded_peers[i] = *peer;
+        }
 
         tracing::debug!(
             "Publisher: publishing record for unix_minute {} with {} active_peers and {} message_hashes",
             unix_minute,
             active_peers.len(),
-            last_message_hashes.len()
+            raw_hashes.len()
         );
 
         let record_content = crate::gossip::GossipRecordContent {
-            active_peers: active_peers.as_slice().try_into()?,
-            last_message_hashes: last_message_hashes.as_slice().try_into()?,
+            active_peers: padded_peers,
+            last_message_hashes,
         };
 
         tracing::debug!("Publisher: created record content: {:?}", record_content);
