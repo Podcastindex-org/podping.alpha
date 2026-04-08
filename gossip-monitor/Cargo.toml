@@ -1,6 +1,6 @@
 [package]
 name = "gossip-monitor"
-version = "0.5.2"
+version = "0.5.3"
 authors = ["Dave Jones"]
 edition = "2021"
 
