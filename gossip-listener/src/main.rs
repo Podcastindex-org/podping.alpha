@@ -602,8 +602,58 @@ async fn run_catchup(
 }
 
 //Main ---------------------------------------------------------------------------------------------
+fn print_help(bin_name: &str) {
+    println!("gossip-listener {}", env!("CARGO_PKG_VERSION"));
+    println!();
+    println!("Usage: {bin_name} [OPTIONS]");
+    println!();
+    println!("Options:");
+    println!("  -h, --help      Show this help message and exit");
+    println!("  -V, --version   Show version and exit");
+    println!();
+    println!("Configuration is done via environment variables.");
+}
+
+fn handle_cli_flags() -> bool {
+    let mut args = env::args();
+    let bin_name = args
+        .next()
+        .unwrap_or_else(|| "gossip-listener".to_string());
+
+    let mut show_help = false;
+    let mut show_version = false;
+
+    for arg in args {
+        match arg.as_str() {
+            "-h" | "--help" => show_help = true,
+            "-V" | "--version" => show_version = true,
+            _ => {
+                eprintln!("Unknown option: {arg}");
+                eprintln!("Try '{bin_name} --help'");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    if show_help {
+        print_help(&bin_name);
+        return true;
+    }
+
+    if show_version {
+        println!("gossip-listener {}", env!("CARGO_PKG_VERSION"));
+        return true;
+    }
+
+    false
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if handle_cli_flags() {
+        return Ok(());
+    }
+
     // Write tracing output to fd 3 only if TRACE_FD3=1 and fd 3 is a pipe or
     // regular file, otherwise stderr. Uses a non-blocking writer so log spam
     // (e.g., iroh path exhaustion retries) can't starve the tokio runtime.
