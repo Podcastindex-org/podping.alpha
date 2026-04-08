@@ -1,4 +1,5 @@
 use crate::swarm::PeerRegistry;
+use crate::topology;
 use axum::extract::State;
 use axum::http::header;
 use axum::response::sse::{Event, Sse};
@@ -8,7 +9,7 @@ use axum::Router;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, RwLock};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
@@ -16,18 +17,21 @@ use tokio_stream::StreamExt;
 pub struct AppState {
     pub registry: Arc<PeerRegistry>,
     pub sse_tx: broadcast::Sender<String>,
+    pub topology_analysis: Arc<RwLock<Option<topology::TopologyAnalysis>>>,
 }
 
 /// Start the web server and return the broadcast sender for SSE pushes.
 pub fn start_web_server(
     addr: SocketAddr,
     registry: Arc<PeerRegistry>,
+    topology_analysis: Arc<RwLock<Option<topology::TopologyAnalysis>>>,
 ) -> broadcast::Sender<String> {
     let (sse_tx, _) = broadcast::channel::<String>(256);
 
     let state = AppState {
         registry,
         sse_tx: sse_tx.clone(),
+        topology_analysis,
     };
 
     let app = Router::new()
@@ -35,6 +39,7 @@ pub fn start_web_server(
         .route("/js/monitor.js", get(js_handler))
         .route("/css/style.css", get(css_handler))
         .route("/api/swarm", get(swarm_handler))
+        .route("/api/topology", get(topology_handler))
         .route("/api/events", get(events_handler))
         .with_state(state);
 
@@ -66,6 +71,14 @@ async fn css_handler() -> impl IntoResponse {
 
 async fn swarm_handler(State(state): State<AppState>) -> impl IntoResponse {
     Json(state.registry.snapshot())
+}
+
+async fn topology_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let guard = state.topology_analysis.read().await;
+    match &*guard {
+        Some(analysis) => Json(serde_json::json!(analysis)),
+        None => Json(serde_json::json!({})),
+    }
 }
 
 async fn events_handler(

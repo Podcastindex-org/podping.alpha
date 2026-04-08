@@ -1,4 +1,5 @@
 mod swarm;
+mod topology;
 mod web;
 
 use crate::swarm::PeerAnnounce;
@@ -7,17 +8,43 @@ use distributed_topic_tracker::{
     AutoDiscoveryGossip, GossipReceiver as DttGossipReceiver, RecordPublisher,
     TopicId as DttTopicId,
 };
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use iroh::protocol::Router;
 use iroh::SecretKey;
 use iroh_gossip::api::Event;
 use iroh_gossip::net::Gossip;
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::RwLock;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PeerSuggest {
+    #[serde(rename = "type")]
+    msg_type: String,
+    sender: String,
+    target_node_id: String,
+    suggested_peers: Vec<String>,
+    reason: String,
+    timestamp: u64,
+    signature: String,
+}
+
+#[derive(serde::Serialize)]
+struct CanonicalPeerSuggest<'a> {
+    reason: &'a str,
+    sender: &'a str,
+    suggested_peers: &'a Vec<String>,
+    target_node_id: &'a str,
+    timestamp: u64,
+    #[serde(rename = "type")]
+    msg_type: &'a str,
+}
 
 const TOPIC_STRING: &str = "gossipping/v1/all";
 const DEFAULT_NODE_KEY_FILE: &str = "gossip_monitor_node.key";
@@ -75,14 +102,18 @@ async fn main() -> anyhow::Result<()> {
         .spawn();
 
     // Create DTT topic and publisher
-    let dht_signing_key = SigningKey::from_bytes(&node_key_bytes);
+    let signing_key = SigningKey::from_bytes(&node_key_bytes);
+    println!(
+        "  Monitor pubkey: {}",
+        hex::encode(signing_key.verifying_key().to_bytes())
+    );
     let dtt_topic_id = DttTopicId::new(TOPIC_STRING.to_string());
     println!("  Topic ID: {}", hex::encode(dtt_topic_id.hash()));
 
     let record_publisher = RecordPublisher::new(
         dtt_topic_id,
-        dht_signing_key.verifying_key(),
-        dht_signing_key,
+        signing_key.verifying_key(),
+        signing_key.clone(),
         None,
         dht_initial_secret.into_bytes(),
     );
@@ -119,7 +150,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Create registry and start web server
     let registry = Arc::new(PeerRegistry::new());
-    let sse_tx = web::start_web_server(web_bind_addr, registry.clone());
+    let topology_analysis: Arc<RwLock<Option<topology::TopologyAnalysis>>> =
+        Arc::new(RwLock::new(None));
+    let sse_tx = web::start_web_server(web_bind_addr, registry.clone(), topology_analysis.clone());
     println!("  Web server listening on {}", web_bind_addr);
 
     // Periodic task: broadcast SwarmSnapshot via SSE every 5 seconds
@@ -145,6 +178,95 @@ async fn main() -> anyhow::Result<()> {
             let pruned = prune_registry.prune_stale();
             if pruned > 0 {
                 println!("  Pruned {} stale peers", pruned);
+            }
+        }
+    });
+
+    // Periodic task: topology analysis and PeerSuggest broadcast every 60 seconds
+    let topo_registry = registry.clone();
+    let topo_sender = sender.clone();
+    let topo_signing_key = signing_key.clone();
+    let topo_analysis = topology_analysis.clone();
+    let monitor_pubkey = hex::encode(signing_key.verifying_key().to_bytes());
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut last_suggest: HashMap<String, Instant> = HashMap::new();
+        loop {
+            interval.tick().await;
+            let snapshot = topo_registry.snapshot();
+            let analysis = topology::analyze_topology(&snapshot);
+
+            // Store analysis for web API
+            {
+                let mut guard = topo_analysis.write().await;
+                *guard = Some(analysis.clone());
+            }
+
+            let now_instant = Instant::now();
+            for suggestion in &analysis.suggestions {
+                // Rate limit: skip if we suggested to this target less than 300s ago
+                if let Some(last) = last_suggest.get(&suggestion.target_node_id) {
+                    if now_instant.duration_since(*last).as_secs() < 300 {
+                        continue;
+                    }
+                }
+
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+
+                let msg_type = "peer_suggest".to_string();
+
+                // Build canonical form for signing (fields in alphabetical order)
+                let canonical = CanonicalPeerSuggest {
+                    reason: &suggestion.reason,
+                    sender: &monitor_pubkey,
+                    suggested_peers: &suggestion.suggested_peers,
+                    target_node_id: &suggestion.target_node_id,
+                    timestamp,
+                    msg_type: &msg_type,
+                };
+                let canonical_bytes = match serde_json::to_vec(&canonical) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("  [WARN] Failed to serialize canonical PeerSuggest: {}", e);
+                        continue;
+                    }
+                };
+
+                let signature = topo_signing_key.sign(&canonical_bytes);
+                let signature_hex = hex::encode(signature.to_bytes());
+
+                let msg = PeerSuggest {
+                    msg_type: msg_type.clone(),
+                    sender: monitor_pubkey.clone(),
+                    target_node_id: suggestion.target_node_id.clone(),
+                    suggested_peers: suggestion.suggested_peers.clone(),
+                    reason: suggestion.reason.clone(),
+                    timestamp,
+                    signature: signature_hex,
+                };
+
+                match serde_json::to_vec(&msg) {
+                    Ok(data) => {
+                        if let Err(e) = topo_sender.broadcast(data).await {
+                            eprintln!("  [WARN] Failed to broadcast PeerSuggest: {}", e);
+                        } else {
+                            println!(
+                                "  [SUGGEST] Suggesting {} peers to {} (reason: {})",
+                                suggestion.suggested_peers.len(),
+                                suggestion.target_node_id,
+                                suggestion.reason
+                            );
+                            last_suggest
+                                .insert(suggestion.target_node_id.clone(), now_instant);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("  [WARN] Failed to serialize PeerSuggest: {}", e);
+                    }
+                }
             }
         }
     });

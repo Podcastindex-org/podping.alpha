@@ -107,6 +107,62 @@ struct CanonicalPeerEndorse<'a> {
     version: &'a str,
 }
 
+// PeerSuggest: topology suggestion from a trusted gossip-monitor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PeerSuggest {
+    #[serde(rename = "type")]
+    msg_type: String,
+    sender: String,
+    target_node_id: String,
+    suggested_peers: Vec<String>,
+    reason: String,
+    timestamp: u64,
+    signature: String,
+}
+
+#[derive(Serialize)]
+struct CanonicalPeerSuggest<'a> {
+    reason: &'a str,
+    sender: &'a str,
+    suggested_peers: &'a Vec<String>,
+    target_node_id: &'a str,
+    timestamp: u64,
+    #[serde(rename = "type")]
+    msg_type: &'a str,
+}
+
+impl PeerSuggest {
+    fn verify_signature(&self) -> Result<bool, String> {
+        let pubkey_bytes: [u8; 32] = hex::decode(&self.sender)
+            .map_err(|e| format!("Bad sender hex: {e}"))?
+            .try_into()
+            .map_err(|_| "Sender not 32 bytes".to_string())?;
+        let sig_bytes: [u8; 64] = hex::decode(&self.signature)
+            .map_err(|e| format!("Bad signature hex: {e}"))?
+            .try_into()
+            .map_err(|_| "Signature not 64 bytes".to_string())?;
+
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pubkey_bytes)
+            .map_err(|e| format!("Bad pubkey: {e}"))?;
+        let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+
+        let canonical = CanonicalPeerSuggest {
+            reason: &self.reason,
+            sender: &self.sender,
+            suggested_peers: &self.suggested_peers,
+            target_node_id: &self.target_node_id,
+            timestamp: self.timestamp,
+            msg_type: &self.msg_type,
+        };
+        let canonical_bytes = serde_json::to_vec(&canonical).map_err(|e| format!("JSON error: {e}"))?;
+
+        match verifying_key.verify(&canonical_bytes, &signature) {
+            Ok(()) => Ok(true),
+            Err(e) => Err(format!("Signature verification failed: {e}")),
+        }
+    }
+}
+
 impl PeerAnnounce {
     fn new(node_id: &str, version: &str, friendly_name: Option<String>, metrics: AnnounceMetrics) -> Self {
         let timestamp = SystemTime::now()
@@ -279,6 +335,7 @@ const DEFAULT_NODE_KEY_FILE: &str = "/data/gossip/iroh_node.key";
 const DEFAULT_ARCHIVE_PATH: &str = "/data/gossip/archive.db";
 const DEFAULT_KNOWN_PEERS_FILE: &str = "/data/gossip/known_peers.txt";
 const DEFAULT_TRUSTED_PUBLISHERS_FILE: &str = "/data/gossip/trusted_publishers.txt";
+const DEFAULT_TRUSTED_MONITORS_FILE: &str = "trusted_monitors.txt";
 const TOPIC_STRING: &str = "gossipping/v1/all";
 const DEFAULT_DHT_SECRET: &str = "podping_gossip_default_secret";
 const DEFAULT_PEER_ENDORSE_INTERVAL: u64 = 600;
@@ -445,6 +502,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &trusted_publishers_file,
     )));
 
+    let trusted_monitors_file = env::var("TRUSTED_MONITORS_FILE")
+        .unwrap_or_else(|_| DEFAULT_TRUSTED_MONITORS_FILE.to_string());
+    let trusted_monitors: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(
+        load_trusted_keys(&trusted_monitors_file)
+    ));
+
     println!("gossip-writer v{}", env!("CARGO_PKG_VERSION"));
     println!("  ZMQ bind:     {}", zmq_bind);
     println!("  Key file:     {}", key_file);
@@ -475,6 +538,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  Trusted publisher filter: {} senders", tp.len());
         }
     }
+    println!("  Trusted monitors: {}", trusted_monitors.read().unwrap().len());
 
     // --- Load or generate ed25519 signing key ---
     let signing_key = notification::load_or_generate_key(&key_file)?;
@@ -616,6 +680,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         neighbor_count.clone(),
         neighbor_ids.clone(),
         unique_sources.clone(),
+        trusted_monitors.clone(),
+        shared_sender.clone(),
     );
 
     // --- Async broadcast task (with reconnection) ---
@@ -645,6 +711,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reconnect_last_notif = last_notification_time.clone();
     let reconnect_peer_names = peer_names.clone();
     let reconnect_receive_generation = receive_generation.clone();
+    let reconnect_trusted_monitors = trusted_monitors.clone();
     tokio::spawn(async move {
         // Keep the router alive in this task; on reconnect we replace it
         // (dropping the old router aborts its accept loop without closing the endpoint)
@@ -724,6 +791,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 bcast_neighbor_count.clone(),
                                 bcast_neighbor_ids.clone(),
                                 bcast_unique_sources.clone(),
+                                reconnect_trusted_monitors.clone(),
+                                broadcast_shared.clone(),
                             );
 
                             // Reset neighbor tracking — fresh subscription
@@ -863,6 +932,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     bcast_neighbor_count.clone(),
                                     bcast_neighbor_ids.clone(),
                                     bcast_unique_sources.clone(),
+                                    reconnect_trusted_monitors.clone(),
+                                    broadcast_shared.clone(),
                                 );
 
                                 bcast_neighbor_ids.write().unwrap().clear();
@@ -1574,6 +1645,16 @@ fn send_zmq_reply(
     Ok(())
 }
 
+// Load trusted keys from a text file (one hex pubkey per line, # comments allowed).
+fn load_trusted_keys(path: &str) -> HashSet<String> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect()
+}
+
 // Load trusted publisher public keys from a text file (one hex pubkey per line).
 // Returns an empty HashSet if the file doesn't exist or is empty.
 fn load_trusted_publishers(path: &str) -> HashSet<String> {
@@ -1707,9 +1788,12 @@ fn spawn_receive_task(
     neighbor_count: Arc<AtomicU32>,
     neighbor_ids: Arc<RwLock<HashSet<String>>>,
     unique_sources: Arc<Mutex<HashSet<String>>>,
+    trusted_monitors: Arc<RwLock<HashSet<String>>>,
+    shared_sender: Arc<tokio::sync::RwLock<DttGossipSender>>,
 ) {
     tokio::spawn(async move {
         let heartbeat_duration = std::time::Duration::from_secs(REBOOTSTRAP_TIMEOUT * 2);
+        let my_node_id_str = my_node_id.to_string();
         loop {
             let event = tokio::select! {
                 event = receiver.next() => {
@@ -1738,7 +1822,46 @@ fn spawn_receive_task(
                     if let Ok(mut sources) = unique_sources.lock() {
                         sources.insert(msg.delivered_from.to_string());
                     }
-                    // Try PeerAnnounce first
+                    // Try PeerSuggest first (before PeerAnnounce)
+                    if let Ok(suggest) = serde_json::from_slice::<PeerSuggest>(&msg.content) {
+                        if suggest.msg_type == "peer_suggest" {
+                            if suggest.target_node_id == my_node_id_str {
+                                match suggest.verify_signature() {
+                                    Ok(true) => {
+                                        let is_trusted = {
+                                            let monitors = trusted_monitors.read().unwrap();
+                                            monitors.contains(&suggest.sender)
+                                        };
+                                        if is_trusted {
+                                            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                                            if now.saturating_sub(suggest.timestamp) < 300 {
+                                                let peers: Vec<iroh::EndpointId> = suggest.suggested_peers.iter()
+                                                    .filter_map(|s| s.parse().ok())
+                                                    .collect();
+                                                if !peers.is_empty() {
+                                                    println!(
+                                                        "\x1b[1;36m[SUGGEST] Received peer suggestion from trusted monitor {}: joining {} peers (reason: {})\x1b[0m",
+                                                        &suggest.sender[..8], peers.len(), suggest.reason
+                                                    );
+                                                    let sender = shared_sender.read().await;
+                                                    if let Err(e) = sender.join_peers_direct(peers, None).await {
+                                                        eprintln!("\x1b[35m[WARN] Failed to join suggested peers: {}\x1b[0m", e);
+                                                    }
+                                                }
+                                            } else {
+                                                eprintln!("\x1b[35m[WARN] Ignoring stale peer_suggest ({}s old)\x1b[0m", now.saturating_sub(suggest.timestamp));
+                                            }
+                                        }
+                                    }
+                                    Ok(false) | Err(_) => {
+                                        // Invalid signature — ignore silently
+                                    }
+                                }
+                            }
+                            continue; // Don't try to parse as PeerAnnounce
+                        }
+                    }
+                    // Try PeerAnnounce
                     if let Ok(announce) = serde_json::from_slice::<PeerAnnounce>(&msg.content) {
                         if announce.msg_type == "peer_announce" {
                             let metrics_str = match (announce.cpu_percent, announce.memory_mb, announce.thread_count) {
