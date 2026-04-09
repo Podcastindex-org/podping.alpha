@@ -62,14 +62,20 @@ async fn index_handler() -> Html<&'static str> {
 
 async fn js_handler() -> impl IntoResponse {
     (
-        [(header::CONTENT_TYPE, "application/javascript")],
+        [
+            (header::CONTENT_TYPE, "application/javascript"),
+            (header::CACHE_CONTROL, "no-cache, must-revalidate"),
+        ],
         include_str!("static/monitor.js"),
     )
 }
 
 async fn css_handler() -> impl IntoResponse {
     (
-        [(header::CONTENT_TYPE, "text/css")],
+        [
+            (header::CONTENT_TYPE, "text/css"),
+            (header::CACHE_CONTROL, "no-cache, must-revalidate"),
+        ],
         include_str!("static/style.css"),
     )
 }
