@@ -40,26 +40,22 @@ header h1 {
 }
 
 main {
-    display: grid;
-    grid-template-columns: 1fr;
-    gap: 1rem;
-    padding: 1rem;
-    max-width: 1600px;
-    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+    padding: 1rem 0;
 }
 
 section {
-    background: #16213e;
-    border-radius: 8px;
-    padding: 1rem;
+    padding: 0 1.5rem;
+    max-width: 1600px;
+    width: 100%;
+    margin: 0 auto;
 }
 
-#cards-section {
-    grid-column: 1 / -1;
-}
-
-#table-section {
-    grid-column: 1 / -1;
+#graph-section {
+    max-width: none;
+    padding: 0;
 }
 
 section h2 {
@@ -263,7 +259,6 @@ tbody tr.stale td {
 }
 
 /* Suggestion Log */
-#log-section { grid-column: 1 / -1; }
 .suggestion-log {
     max-height: 360px;
     overflow-y: auto;
