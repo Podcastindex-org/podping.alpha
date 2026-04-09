@@ -469,7 +469,7 @@ async function fetchSuggestions() {
 function renderSuggestionLog(entries) {
     var container = document.getElementById("suggestion-log");
     if (!entries || entries.length === 0) {
-        container.innerHTML = '<p class="log-empty">No suggestions sent yet.</p>';
+        container.innerHTML = '<p class="log-empty">$ waiting for topology analysis...</p>';
         return;
     }
     // Show newest first
@@ -477,15 +477,19 @@ function renderSuggestionLog(entries) {
     for (var i = entries.length - 1; i >= 0; i--) {
         var e = entries[i];
         var dt = new Date(e.timestamp * 1000);
-        var timeStr = dt.toLocaleTimeString();
-        var dateStr = dt.toLocaleDateString();
-        var targetDisplay = esc(e.target_name || shortId(e.target_node_id));
+        var h = dt.getHours().toString().padStart(2, "0");
+        var m = dt.getMinutes().toString().padStart(2, "0");
+        var s = dt.getSeconds().toString().padStart(2, "0");
+        var mon = (dt.getMonth() + 1).toString().padStart(2, "0");
+        var day = dt.getDate().toString().padStart(2, "0");
+        var timeStr = dt.getFullYear() + "-" + mon + "-" + day + " " + h + ":" + m + ":" + s;
+        var targetDisplay = e.target_name || shortId(e.target_node_id);
         var peerList = e.suggested_peers.map(function(p) { return shortId(p); }).join(", ");
         html += '<div class="log-entry">'
-            + '<span class="log-time">' + dateStr + " " + timeStr + '</span> '
+            + '<span class="log-time">[' + timeStr + ']</span> '
             + '<span class="log-reason">' + esc(e.reason) + '</span> '
             + '<span class="log-arrow">&rarr;</span> '
-            + '<strong>' + targetDisplay + '</strong>: '
+            + '<strong>' + esc(targetDisplay) + '</strong> '
             + '<span class="log-peers">join [' + esc(peerList) + ']</span>'
             + '</div>';
     }

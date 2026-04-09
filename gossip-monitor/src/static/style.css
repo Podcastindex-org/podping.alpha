@@ -109,23 +109,44 @@ section h2 {
 
 .peer-cards {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-    gap: 1rem;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1.25rem;
+    padding: 0.5rem;
+}
+
+@media (max-width: 1200px) {
+    .peer-cards { grid-template-columns: repeat(2, 1fr); }
+}
+
+@media (max-width: 700px) {
+    .peer-cards { grid-template-columns: 1fr; }
 }
 
 .peer-card {
     background: #0f3460;
-    border: 1px solid #334;
-    border-radius: 8px;
-    padding: 0.75rem;
+    border: 1px solid #2a4a7f;
+    border-radius: 10px;
+    padding: 1rem;
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
-    transition: opacity 0.3s;
+    gap: 0.6rem;
+    transition: opacity 0.3s, box-shadow 0.2s;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.peer-card:hover {
+    box-shadow: 0 4px 16px rgba(233, 69, 96, 0.15);
+    border-color: #e94560;
 }
 
 .peer-card.stale {
-    opacity: 0.4;
+    opacity: 0.35;
+    border-color: #333;
+}
+
+.peer-card.stale:hover {
+    box-shadow: none;
+    border-color: #333;
 }
 
 .card-header {
@@ -244,15 +265,20 @@ tbody tr.stale td {
 /* Suggestion Log */
 #log-section { grid-column: 1 / -1; }
 .suggestion-log {
-    max-height: 300px;
+    max-height: 360px;
     overflow-y: auto;
-    font-family: "Consolas", "Fira Code", monospace;
-    font-size: 0.8em;
-    line-height: 1.6;
+    background: #0a0a14;
+    border: 1px solid #222;
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", "Consolas", "SF Mono", monospace;
+    font-size: 0.78rem;
+    line-height: 1.7;
 }
-.log-empty { color: #666; font-style: italic; }
-.log-entry { padding: 2px 0; border-bottom: 1px solid #1a1a2e; }
-.log-time { color: #666; }
-.log-reason { color: #e94560; font-weight: 600; }
-.log-arrow { color: #666; margin: 0 4px; }
-.log-peers { color: #42a5f5; }
+.log-empty { color: #555; }
+.log-entry { padding: 1px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.log-time { color: #606060; }
+.log-reason { color: #e94560; }
+.log-arrow { color: #444; }
+.log-entry strong { color: #4fc3f7; font-weight: 600; }
+.log-peers { color: #81c784; }
