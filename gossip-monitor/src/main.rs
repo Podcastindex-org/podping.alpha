@@ -127,12 +127,29 @@ async fn main() -> anyhow::Result<()> {
         dht_initial_secret.clone().into_bytes(),
     );
 
-    // Subscribe to topic
+    // Subscribe to topic via DTT for initial DHT bootstrap
     let topic = gossip
         .subscribe_and_join_with_auto_discovery_no_wait(record_publisher)
         .await?;
-    let (gossip_sender, gossip_receiver) = topic.split().await?;
-    println!("  Joined gossip topic with DHT auto-discovery.");
+    let (dtt_sender, _dtt_receiver) = topic.split().await?;
+    println!("  Joined gossip topic with DHT auto-discovery (bootstrap phase).");
+
+    // Wait briefly for DHT bootstrap to discover and connect to peers
+    println!("  Waiting 10s for DHT bootstrap to establish connections...");
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+    // Switch to direct iroh-gossip subscription, bypassing DTT's ongoing actors
+    // (BubbleMerge, MessageOverlapMerge, Publisher) that aggressively call join_peers
+    let topic_hash = iroh_gossip::proto::TopicId::from(DttTopicId::new(TOPIC_STRING.to_string()).hash());
+    let gossip_topic = gossip.subscribe(topic_hash, vec![]).await?;
+    let (raw_sender, raw_receiver) = gossip_topic.split();
+    let gossip_sender = DttGossipSender::new(raw_sender, gossip.clone());
+    let gossip_receiver = DttGossipReceiver::new(raw_receiver, gossip.clone());
+
+    // Drop the DTT sender to release references to DTT's internal actors
+    drop(dtt_sender);
+    drop(_dtt_receiver);
+    println!("  Switched from DTT to direct iroh-gossip (DTT actors stopped).");
 
     // Shared state for resilience
     let shared_sender: Arc<tokio::sync::RwLock<DttGossipSender>> =
@@ -439,7 +456,7 @@ async fn main() -> anyhow::Result<()> {
         let reconnect_gossip_handle = shared_gossip.clone();
         let reconnect_endpoint = endpoint.clone();
         let reconnect_node_key_bytes = node_key_bytes;
-        let reconnect_dht_secret = dht_initial_secret.clone();
+        let _reconnect_dht_secret = dht_initial_secret.clone();
         let reconnect_peers_file = peers_file.clone();
         let reconnect_my_node_id = my_node_id;
         let reconnect_last_notif = last_notification_time.clone();
@@ -529,16 +546,6 @@ async fn main() -> anyhow::Result<()> {
                         let _ = old_gossip.shutdown().await;
                     }
 
-                    let dht_key =
-                        ed25519_dalek::SigningKey::from_bytes(&reconnect_node_key_bytes);
-                    let dtt_topic = DttTopicId::new(TOPIC_STRING.to_string());
-                    let publisher = RecordPublisher::new(
-                        dtt_topic,
-                        dht_key.verifying_key(),
-                        dht_key,
-                        None,
-                        reconnect_dht_secret.clone().into_bytes(),
-                    );
                     // Spawn a fresh Gossip actor on the current endpoint
                     let new_gossip = Gossip::builder()
                         .max_message_size(65536)
@@ -547,60 +554,53 @@ async fn main() -> anyhow::Result<()> {
                     let new_router_builder = Router::builder(_current_endpoint.clone())
                         .accept(iroh_gossip::ALPN, new_gossip.clone());
                     _current_router = new_router_builder.spawn();
-                    match new_gossip
-                        .subscribe_and_join_with_auto_discovery_no_wait(publisher)
-                        .await
-                    {
-                        Ok(new_topic) => match new_topic.split().await {
-                            Ok((new_sender, new_receiver)) => {
-                                // Replace the shared sender and gossip handle
-                                {
-                                    let mut sender_guard = reconnect_shared.write().await;
-                                    *sender_guard = new_sender;
-                                }
-                                {
-                                    let mut gossip_guard =
-                                        reconnect_gossip_handle.write().await;
-                                    *gossip_guard = new_gossip.clone();
-                                }
-                                reconnect_failures.store(0, Ordering::Relaxed);
-
-                                // Spawn a fresh receive task
-                                spawn_receive_task(
-                                    new_receiver,
-                                    reconnect_peers_file.clone(),
-                                    reconnect_my_node_id,
-                                    reconnect_last_notif.clone(),
-                                    reconnect_notif_count.clone(),
-                                    reconnect_failures.clone(),
-                                    reconnect_requested_flag.clone(),
-                                    reconnect_notify_handle.clone(),
-                                    reconnect_receive_generation.clone(),
-                                    reconnect_receive_generation
-                                        .fetch_add(1, Ordering::Relaxed)
-                                        + 1,
-                                    reconnect_shutdown.clone(),
-                                    reconnect_neighbor_count.clone(),
-                                    reconnect_neighbor_ids.clone(),
-                                    reconnect_unique_sources.clone(),
-                                    reconnect_registry.clone(),
-                                );
-
-                                // Reset neighbor tracking — fresh subscription starts with 0 neighbors
-                                reconnect_neighbor_ids.write().unwrap().clear();
-                                reconnect_neighbor_count.store(0, Ordering::Relaxed);
-                                last_reconnect = Instant::now();
-                                reconnect_counter.fetch_add(1, Ordering::Relaxed);
-                                println!("[RECONNECT] Gossip topic reconnected successfully.");
+                    // Subscribe directly to iroh-gossip, bypassing DTT actors (no BubbleMerge/Publisher overhead)
+                    let topic_hash = iroh_gossip::proto::TopicId::from(DttTopicId::new(TOPIC_STRING.to_string()).hash());
+                    match new_gossip.subscribe(topic_hash, vec![]).await {
+                        Ok(new_gossip_topic) => {
+                            let (raw_sender, raw_receiver) = new_gossip_topic.split();
+                            let new_sender = DttGossipSender::new(raw_sender, new_gossip.clone());
+                            let new_receiver = DttGossipReceiver::new(raw_receiver, new_gossip.clone());
+                            // Replace the shared sender and gossip handle
+                            {
+                                let mut sender_guard = reconnect_shared.write().await;
+                                *sender_guard = new_sender;
                             }
-                            Err(e) => {
-                                eprintln!(
-                                    "[RECONNECT] Failed to split topic: {}. Will retry.",
-                                    e
-                                );
-                                reconnect_failures.store(0, Ordering::Relaxed);
+                            {
+                                let mut gossip_guard =
+                                    reconnect_gossip_handle.write().await;
+                                *gossip_guard = new_gossip.clone();
                             }
-                        },
+                            reconnect_failures.store(0, Ordering::Relaxed);
+
+                            // Spawn a fresh receive task
+                            spawn_receive_task(
+                                new_receiver,
+                                reconnect_peers_file.clone(),
+                                reconnect_my_node_id,
+                                reconnect_last_notif.clone(),
+                                reconnect_notif_count.clone(),
+                                reconnect_failures.clone(),
+                                reconnect_requested_flag.clone(),
+                                reconnect_notify_handle.clone(),
+                                reconnect_receive_generation.clone(),
+                                reconnect_receive_generation
+                                    .fetch_add(1, Ordering::Relaxed)
+                                    + 1,
+                                reconnect_shutdown.clone(),
+                                reconnect_neighbor_count.clone(),
+                                reconnect_neighbor_ids.clone(),
+                                reconnect_unique_sources.clone(),
+                                reconnect_registry.clone(),
+                            );
+
+                            // Reset neighbor tracking — fresh subscription starts with 0 neighbors
+                            reconnect_neighbor_ids.write().unwrap().clear();
+                            reconnect_neighbor_count.store(0, Ordering::Relaxed);
+                            last_reconnect = Instant::now();
+                            reconnect_counter.fetch_add(1, Ordering::Relaxed);
+                            println!("[RECONNECT] Gossip topic reconnected successfully (direct, no DTT actors).");
+                        }
                         Err(e) => {
                             eprintln!(
                                 "[RECONNECT] Failed to re-subscribe: {}. Will retry.",

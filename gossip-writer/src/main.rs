@@ -361,23 +361,13 @@ struct PendingPing {
 
 async fn reconnect_gossip_topic(
     endpoint: iroh::Endpoint,
-    node_key_bytes: [u8; 32],
-    dht_initial_secret: String,
+    _node_key_bytes: [u8; 32],
+    _dht_initial_secret: String,
     old_gossip: &Gossip,
 ) -> Result<(DttGossipSender, DttGossipReceiver, Router, Gossip), Box<dyn std::error::Error + Send + Sync>>
 {
     // Shut down the old Gossip actor so all its internal dtt actors stop
     let _ = old_gossip.shutdown().await;
-
-    let dht_key = ed25519_dalek::SigningKey::from_bytes(&node_key_bytes);
-    let dtt_topic = DttTopicId::new(TOPIC_STRING.to_string());
-    let publisher = RecordPublisher::new(
-        dtt_topic,
-        dht_key.verifying_key(),
-        dht_key,
-        None,
-        dht_initial_secret.into_bytes(),
-    );
 
     let new_gossip = Gossip::builder()
         .max_message_size(65536)
@@ -385,10 +375,12 @@ async fn reconnect_gossip_topic(
     let new_router = Router::builder(endpoint.clone())
         .accept(iroh_gossip::ALPN, new_gossip.clone())
         .spawn();
-    let new_topic = new_gossip
-        .subscribe_and_join_with_auto_discovery_no_wait(publisher)
-        .await?;
-    let (new_sender, new_receiver) = new_topic.split().await?;
+    // Subscribe directly to iroh-gossip, bypassing DTT actors (no BubbleMerge/Publisher overhead)
+    let topic_hash = iroh_gossip::proto::TopicId::from(DttTopicId::new(TOPIC_STRING.to_string()).hash());
+    let new_gossip_topic = new_gossip.subscribe(topic_hash, vec![]).await?;
+    let (raw_sender, raw_receiver) = new_gossip_topic.split();
+    let new_sender = DttGossipSender::new(raw_sender, new_gossip.clone());
+    let new_receiver = DttGossipReceiver::new(raw_receiver, new_gossip.clone());
 
     Ok((new_sender, new_receiver, new_router, new_gossip))
 }
@@ -591,8 +583,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let topic = gossip
         .subscribe_and_join_with_auto_discovery_no_wait(record_publisher)
         .await?;
-    let (gossip_sender, gossip_receiver) = topic.split().await?;
-    println!("  Joined gossip topic with DHT auto-discovery.");
+    let (dtt_sender, _dtt_receiver) = topic.split().await?;
+    println!("  Joined gossip topic with DHT auto-discovery (bootstrap phase).");
+
+    // Wait briefly for DHT bootstrap to discover and connect to peers
+    println!("  Waiting 10s for DHT bootstrap to establish connections...");
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+    // Switch to direct iroh-gossip subscription, bypassing DTT's ongoing actors
+    // (BubbleMerge, MessageOverlapMerge, Publisher) that aggressively call join_peers
+    let topic_hash = iroh_gossip::proto::TopicId::from(DttTopicId::new(TOPIC_STRING.to_string()).hash());
+    let gossip_topic = gossip.subscribe(topic_hash, vec![]).await?;
+    let (raw_sender, raw_receiver) = gossip_topic.split();
+    let gossip_sender = DttGossipSender::new(raw_sender, gossip.clone());
+    let gossip_receiver = DttGossipReceiver::new(raw_receiver, gossip.clone());
+
+    // Drop the DTT sender to release references to DTT's internal actors
+    drop(dtt_sender);
+    drop(_dtt_receiver);
+    println!("  Switched from DTT to direct iroh-gossip (DTT actors stopped).");
 
     // Shared sender so watchdog and broadcast task can both use (and reconnect can replace) it
     let shared_sender: Arc<tokio::sync::RwLock<DttGossipSender>> =
