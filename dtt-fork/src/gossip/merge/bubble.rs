@@ -68,7 +68,7 @@ impl Actor<anyhow::Error> for BubbleMergeActor {
                 _ = self.ticker.tick() => {
                     tracing::debug!("BubbleMerge: tick fired, checking for bubbles");
                     let _ = self.merge().await;
-                    let next_interval = rand::random::<u64>() % 50;
+                    let next_interval = 60 + rand::random::<u64>() % 120;
                     tracing::debug!("BubbleMerge: next check in {}s", next_interval);
                     self.ticker.reset_after(Duration::from_secs(next_interval));
                 }

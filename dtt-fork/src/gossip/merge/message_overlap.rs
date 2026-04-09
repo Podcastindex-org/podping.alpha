@@ -63,7 +63,7 @@ impl Actor<anyhow::Error> for MessageOverlapMergeActor {
                 _ = self.ticker.tick() => {
                     tracing::debug!("MessageOverlapMerge: tick fired, checking for split-brain");
                     let _ = self.merge().await;
-                    let next_interval = rand::random::<u64>() % 50;
+                    let next_interval = 60 + rand::random::<u64>() % 120;
                     tracing::debug!("MessageOverlapMerge: next check in {}s", next_interval);
                     self.ticker.reset_after(Duration::from_secs(next_interval));
                 }
