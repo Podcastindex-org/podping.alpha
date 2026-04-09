@@ -296,15 +296,22 @@ function renderGraph(data) {
     const svg = d3.select("#topology");
     const container = document.getElementById("graph-section");
     const width = container.clientWidth - 32;
-    const height = 400;
+    const height = 700;
     svg.attr("width", width).attr("height", height);
 
     // One-time initialization
     if (!graphInitialized) {
         graphG = svg.append("g");
-        svg.call(d3.zoom().scaleExtent([0.2, 4]).on("zoom", (event) => {
+        const zoom = d3.zoom().scaleExtent([0.2, 6]).on("zoom", (event) => {
             graphG.attr("transform", event.transform);
-        }));
+        });
+        svg.call(zoom);
+        // Set initial zoom level — 1.8x centered in the viewport
+        const initialTransform = d3.zoomIdentity
+            .translate(width / 2, height / 2)
+            .scale(1.8)
+            .translate(-width / 2, -height / 2);
+        svg.call(zoom.transform, initialTransform);
         graphInitialized = true;
     }
 
