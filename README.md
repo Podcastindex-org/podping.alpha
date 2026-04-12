@@ -11,7 +11,7 @@ version is to wireframe the p2p gossip writer and corresponding front-end suppor
 ## Testing
 At this point on the development just running the `gossip-listener` will help with the testing.
 
-Setting `ARCHIVE_ENABLED` to `1`, `yes` or `true` could be a second step, but this could fill up your hard disk.
+Setting `ARCHIVE_ENABLED` and `CATCHUP_ENABLED` to `1`, `yes` or `true` could be a second step.
 
 Check the [gossip-listener documentation](gossip-listener/README.md) for all the info.
 
