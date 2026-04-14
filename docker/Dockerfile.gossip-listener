@@ -14,11 +14,11 @@ COPY artifacts /tmp/artifacts
 RUN set -ex; \
     case "$TARGETPLATFORM" in \
         "linux/amd64") \
-            cp /tmp/artifacts/x86_64-unknown-linux-gnu-binary/gossip-listener /app/gossip-listener ;; \
+            cp /tmp/artifacts/gossip-listener-x86_64-unknown-linux-gnu-binary/gossip-listener /app/gossip-listener ;; \
         "linux/arm64") \
-            cp /tmp/artifacts/aarch64-unknown-linux-gnu-binary/gossip-listener /app/gossip-listener ;; \
+            cp /tmp/artifacts/gossip-listener-aarch64-unknown-linux-gnu-binary/gossip-listener /app/gossip-listener ;; \
         "linux/arm/v7") \
-            cp /tmp/artifacts/armv7-unknown-linux-gnueabihf-binary/gossip-listener /app/gossip-listener ;; \
+            cp /tmp/artifacts/gossip-listener-armv7-unknown-linux-gnueabihf-binary/gossip-listener /app/gossip-listener ;; \
         *) \
             echo "Unsupported platform: $TARGETPLATFORM"; exit 1 ;; \
     esac; \
