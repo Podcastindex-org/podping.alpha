@@ -41,7 +41,7 @@ for Linux, macOS, and ~Windows~  under the release assets.
 
 Download and verify:
 ```sh
-VERSION="v0.5.1"
+VERSION="v0.6.0"
 OS=$(uname -s) # linux | macos
 [ "${OS,,}" = darwin ] && OS="macos" 
 ARCH=x86_64 # x86_64 | aarch64 | armv7

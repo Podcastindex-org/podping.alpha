@@ -11,7 +11,7 @@ version is to wireframe the p2p gossip writer and corresponding front-end suppor
 ## Testing
 At this point on the development just running the `gossip-listener` will help with the testing.
 
-Setting `ARCHIVE_ENABLED` to `1`, `yes` or `true` could be a second step, but this could fill up your hard disk.
+Setting `ARCHIVE_ENABLED` and `CATCHUP_ENABLED` to `1`, `yes` or `true` could be a second step.
 
 Check the [gossip-listener documentation](gossip-listener/README.md) for all the info.
 
@@ -19,9 +19,12 @@ Check the [gossip-listener documentation](gossip-listener/README.md) for all the
 ```shell
 git clone https://github.com/Podcastindex-org/podping.alpha.git && cd "$(basename "$_" .git)"
 cd gossip-listener
-cargo build
+cargo build # Add --release if you need to optimize the build and improve CPU/MEM usage.
 NODE_FRIENDLY_NAME='IDENTIFICADOR_AMIGABLE' cargo run
 ```
+### Monitor
+You can check your node and all the swarm/network of `gossip-[listeners,writers]` data on https://ppmonitor.podcastindex.org
+
 ### Update
 - Go to the `podping.alpha` directory.
 - Run `git pull`, discard or merge any local changes.
