@@ -18,9 +18,9 @@ async fn main() -> Result<()> {
         "https://iroh-relay.rustonbsd.com:8443/".parse::<iroh::RelayUrl>()?,
     ));
     let dns_lookup = DnsAddressLookup::builder("https://iroh-dns.rustonbsd.com/".parse()?).build();
-    let pkarr_publisher = PkarrPublisher::builder("https://iroh-relay.rustonbsd.com".parse()?).build(secret_key.clone());
+    let pkarr_publisher = PkarrPublisher::builder("https://iroh-relay.rustonbsd.com".parse()?);
 
-    let endpoint = Endpoint::builder()
+    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
         .relay_mode(iroh::RelayMode::Custom(relay_map))
         //.address_lookup(DnsAddressLookup::n0_dns().build())
         //.address_lookup(PkarrPublisher::n0_dns().build(secret_key.clone()))
