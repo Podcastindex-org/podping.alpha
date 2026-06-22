@@ -2040,3 +2040,71 @@ fn spawn_receive_task(
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn signed_notification(signing_key: &SigningKey) -> GossipNotification {
+        let sender = hex::encode(signing_key.verifying_key().to_bytes());
+        let mut notif = GossipNotification {
+            version: "1.1".to_string(),
+            sender,
+            timestamp: 1_700_000_000,
+            medium: "podcast".to_string(),
+            reason: "update".to_string(),
+            iris: vec!["https://example.com/feed.xml".to_string()],
+            seq: Some(42),
+            signature: None,
+        };
+        let sig = signing_key.sign(&notif.canonical_bytes());
+        notif.signature = Some(hex::encode(sig.to_bytes()));
+        notif
+    }
+
+    #[test]
+    fn verifies_valid_notification_signature() {
+        let signing_key = SigningKey::generate(&mut rand::rng());
+        let notif = signed_notification(&signing_key);
+
+        assert_eq!(notif.verify_signature(), Ok(true));
+    }
+
+    #[test]
+    fn rejects_tampered_notification_signature() {
+        let signing_key = SigningKey::generate(&mut rand::rng());
+        let mut notif = signed_notification(&signing_key);
+        notif.reason = "delete".to_string();
+
+        assert!(notif.verify_signature().is_err());
+    }
+
+    #[test]
+    fn reports_unsigned_notification_without_error() {
+        let signing_key = SigningKey::generate(&mut rand::rng());
+        let mut notif = signed_notification(&signing_key);
+        notif.signature = None;
+
+        assert_eq!(notif.verify_signature(), Ok(false));
+    }
+
+    #[test]
+    fn sanitizes_remote_friendly_names() {
+        let raw = format!("  node\x00name\n{}  ", "x".repeat(80));
+        let sanitized = sanitize_friendly_name(&raw);
+
+        assert!(!sanitized.chars().any(|c| c.is_control()));
+        assert!(sanitized.len() <= 64);
+        assert!(sanitized.starts_with("nodename"));
+        assert!(!sanitized.starts_with(' '));
+        assert!(!sanitized.ends_with(' '));
+    }
+
+    #[test]
+    fn compares_semver_style_versions() {
+        assert!(version_is_newer("0.6.1", "0.6.0"));
+        assert!(version_is_newer("0.7.0", "0.6.9"));
+        assert!(!version_is_newer("0.6.0", "0.6.0"));
+        assert!(!version_is_newer("0.5.9", "0.6.0"));
+    }
+}
