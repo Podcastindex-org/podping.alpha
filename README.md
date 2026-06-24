@@ -129,6 +129,37 @@ Initially, the `auth.db` and `queue.db` will be blank.  You will need to populat
 `auth.db` file to have a funcional system.  See the example files in the `databases` directory in this repo for an 
 example of the format for publisher token records.
 
+### Using gossip-writer with HivePinger
+
+HivePinger can run beside `gossip-writer` when you want a Podping-compatible HTTP ingestion endpoint to submit each
+request to Hive and to the gossip network.  In this layout, `gossip-writer` binds its ZMQ listener on
+`tcp://0.0.0.0:9998`, and the HivePinger container connects to it over the Docker Compose service name:
+
+```yaml
+services:
+  podping-hivepinger:
+    environment:
+      GOSSIP_WRITER_ENABLED: "true"
+      GOSSIP_WRITER_ZMQ: "tcp://gossip-writer:9998"
+    depends_on:
+      - gossip-writer
+
+  gossip-writer:
+    environment:
+      ZMQ_BIND_ADDR: "tcp://0.0.0.0:9998"
+      IROH_SECRET_FILE: "/data/gossip/iroh.key"
+      ARCHIVE_PATH: "/data/gossip/archive.db"
+      IROH_NODE_KEY_FILE: "/data/gossip/iroh_node.key"
+      KNOWN_PEERS_FILE: "/data/gossip/known_peers.txt"
+      TRUSTED_PUBLISHERS_FILE: "/data/gossip/trusted_publishers.txt"
+    volumes:
+      - ./data:/data
+```
+
+Keep `/data/gossip` on a persistent volume.  It stores the Iroh secret, node key, peer and publisher files, and the
+archive database path if `ARCHIVE_ENABLED` is turned on.  The `9998` port only needs to be reachable by HivePinger on
+the compose network; it does not need to be published on the host unless another external process will connect to it.
+
 <br>
 
 ## The Podping Network Idea
