@@ -8,10 +8,18 @@ use std::time::Duration;
 use actor_helper::{Action, Actor, Handle, Receiver, act};
 use anyhow::{Context, Result, bail};
 use ed25519_dalek::VerifyingKey;
-use futures_lite::StreamExt;
+use futures_lite::{Stream, StreamExt};
 use mainline::{MutableItem, SigningKey};
 
 const RETRY_DEFAULT: usize = 3;
+const GET_RECORD_LIMIT: usize = crate::MAX_BOOTSTRAP_RECORDS;
+
+async fn collect_bounded<S, T>(stream: S, limit: usize) -> Vec<T>
+where
+    S: Stream<Item = T>,
+{
+    stream.take(limit).collect::<Vec<_>>().await
+}
 
 /// DHT client wrapper with actor-based concurrency.
 ///
@@ -120,8 +128,10 @@ impl DhtActor {
         let dht = self.dht.as_mut().context("DHT not initialized")?;
         Ok(tokio::time::timeout(
             timeout,
-            dht.get_mutable(pub_key.as_bytes(), salt.as_deref(), more_recent_than)
-                .collect::<Vec<_>>(),
+            collect_bounded(
+                dht.get_mutable(pub_key.as_bytes(), salt.as_deref(), more_recent_than),
+                GET_RECORD_LIMIT,
+            ),
         )
         .await?)
     }
@@ -185,5 +195,23 @@ impl DhtActor {
     async fn reset(&mut self) -> Result<()> {
         self.dht = Some(mainline::Dht::builder().build()?.as_async());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures_lite::stream;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn collect_bounded_stops_at_limit() {
+        let items = stream::iter(0..(GET_RECORD_LIMIT + 25));
+
+        let collected = collect_bounded(items, GET_RECORD_LIMIT).await;
+
+        assert_eq!(collected.len(), GET_RECORD_LIMIT);
+        assert_eq!(collected.first(), Some(&0));
+        assert_eq!(collected.last(), Some(&(GET_RECORD_LIMIT - 1)));
     }
 }
